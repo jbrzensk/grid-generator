@@ -5,7 +5,7 @@ function gridGenerator(grid_fun,Ns,Nt,N_basis)
 % Outer Brent (fminbnd) optimizes C; inner custom BFGS (no toolbox) optimizes a,b.
 % Boundaries are taken from a sharp-cornered "C" via makeGridHardC.
 
-clear; clc;
+
 
 %% ==================== User settings ======================================
 I = Ns; J = Nt;
