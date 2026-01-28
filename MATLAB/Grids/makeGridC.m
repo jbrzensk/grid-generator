@@ -4,8 +4,8 @@ function [ X, Y ] = makeGridC( nptsx, nptsy )
 Ni = nptsx;  
 Nj = nptsy; 
 
-xi  = linspace(0,1,Ni);      % xi logical coord
-eta = linspace(0,1,Nj);      % eta logical coord
+xi  = linspace(0,1,Ni+1);      % xi logical coord
+eta = linspace(0,1,Nj+1);      % eta logical coord
 
 [Xi, Eta] = meshgrid(xi, eta);
 
