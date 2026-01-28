@@ -9,7 +9,7 @@ addpath(fullfile(pwd,'Grids'));
 % --- Parameters ---
 Ns = 41;       % # columns (s-direction)
 Nt = 41;       % # rows    (t-direction)
-N_basis = 16;  % # basis functions per direction
+N_basis = 0;  % # basis functions per direction
 
 % --- Grid function handle ---
 grid_fun = @makeGridC;  % must return [X,Y] of size Nt x Ns
