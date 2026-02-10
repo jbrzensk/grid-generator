@@ -5,8 +5,8 @@ function [ X, Y ] = makeGridA( nptsx, nptsy )
 Ni = nptsx;   % number of points in x-direction
 Nj = nptsy;   % number of points in y-direction
 
-xi  = linspace(0,1,Ni);      % computational coord along x
-eta = linspace(0,1,Nj);      % computational coord along y
+xi  = linspace(0,1,Ni+1);      % computational coord along x
+eta = linspace(0,1,Nj+1);      % computational coord along y
 
 % uncomment below for edge clustering
 %xi = (sin(linspace(0,pi/2,Ni))).^2;
@@ -82,13 +82,13 @@ P10 = [xb(end), yb(end)]; % bottom-right
 P01 = [xt(1), yt(1)];   % top-left
 P11 = [xt(end), yt(end)]; % top-right
 
-[X, Y] = deal(zeros(Nj, Ni));
+[X, Y] = deal(zeros(Nj+1, Ni+1));
 
 % Quasi-interpolation is close enough for show
-for j = 1:Nj
+for j = 1:Nj+1
     t = eta(j);  % normalized vertical position
     % interpolate along the horizontal direction
-    for i = 1:Ni
+    for i = 1:Ni+1
         s = xi(i);        % normalized horizontal position
         % linear interpolation between left and right boundaries at this eta
         X(j,i) = (1 - s) * xl(j) + s * xr(j);

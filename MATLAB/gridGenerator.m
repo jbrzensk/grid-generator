@@ -1,319 +1,464 @@
-function gridGenerator(grid_fun,Ns,Nt,N_basis)
+function [C_opt, E_opt, Xopt, Yopt, Jc, Aopt, Bopt, Uopt, Vopt] = gridGenerator(grid_fun, Ns, Nt, Nbasis)
+% gridGenerator (generalized solver only) + stochastic coordinate descent for A,B
+% 1) Optimize C using Brent on objective with A=B=0.
+% 2) Optimize A,B via stochastic coordinate FD updates (SGD-like).
+% Objective:
+%   E_total = E_NH + gammaOrth*E_orth + gammaAR*E_ar + betaAB*(||A||^2+||B||^2)
+%
+% Also plots optimal reference grid U,V.
 
-% Reference grid = [s, C t] + [sum a_k f1_k, sum b_k f2_k], with f•_k=0 on boundary.
-% You choose how many basis function3s: N_basis (or Kx_desired/Ky_desired).
-% Outer Brent (fminbnd) optimizes C; inner custom BFGS (no toolbox) optimizes a,b.
-% Boundaries are taken from a sharp-cornered "C" via makeGridHardC.
-
-
-
-%% ==================== User settings ======================================
+%% ===== Settings =====
 I = Ns; J = Nt;
-Kx_desired = N_basis; Ky_desired = N_basis;
 
+% Neo-Hookean parameters
+mu = 1.0;
+lambda = 1.0;
+epsJ = 1e-6;
+kappa = 10.0;
 
-mode_order = 'radial';       % 'radial' (by m^2+n^2) or 'lexico' (by m then n)
+% Spacing
+hs = 1/(I-1);
+ht = 1/(J-1);
 
-mu = 1.0; lambda = 1.0;      % Lamé weights
-C_bracket = [0.01, 10];    % Brent bracket for C
-beta_reg = 1e-6;             % tiny Tikhonov on coeffs
-epsJ = 1e-3;                 % Jacobian safety floor
-kappa = 10.0;                % smooth barrier strength near J -> 0
+% Reference denom safety in generalized solver
+epsDen = 1e-14;
 
-normalize_basis = true;      % normalize bubbles by derivative RMS
-print_modes = true;          % print selected & optimized modes
+% Brent bracket for C
+C_bracket = [0.01, 10];
+C_tol = 1e-6;
 
-%% ==================== Grid setup & C-boundary ============================
-I = Ns; J = Nt;
-hs = 1/(I-1); ht = 1/(J-1);
-nI = I-2; nJ = J-2;
+% Penalty weights (tune these)
+gammaOrth = 1e-2;   % orthogonality penalty strength
+gammaAR   = 1e-2;   % aspect ratio penalty strength
+betaAB    = 1e-4;   % regularize A,B
 
-% Build the sharp-cornered C boundaries (size JxI)
+% SGD-like coordinate descent settings
+sgd.maxIter      = 600;   % more iters; each is cheaper than full FD gradient
+sgd.batchK       = 6;     % coordinates per iteration (2..12 typical)
+sgd.fdStep       = 1e-4;  % finite difference step
+sgd.lr0          = 0.08;  % learning rate start (try 0.03..0.2)
+sgd.decay        = 1e-3;  % lr = lr0/(1+decay*it)
+sgd.displayEvery = 25;
+
+%% ===== Boundary setup =====
 [Xc, Yc] = grid_fun(I-1, J-1);
 
-
-% Fill boundary arrays from the C grid
 BND.X = nan(J,I); BND.Y = nan(J,I);
-BND.X(1,:) = Xc(1,:);    BND.Y(1,:) = Yc(1,:);        % bottom
-BND.X(J,:) = Xc(end,:);  BND.Y(J,:) = Yc(end,:);      % top
-BND.X(:,1) = Xc(:,1);    BND.Y(:,1) = Yc(:,1);        % left
-BND.X(:,I) = Xc(:,end);  BND.Y(:,I) = Yc(:,end);      % right
-% corners (ensure consistency)
+BND.X(1,:) = Xc(1,:);    BND.Y(1,:) = Yc(1,:);
+BND.X(J,:) = Xc(end,:);  BND.Y(J,:) = Yc(end,:);
+BND.X(:,1) = Xc(:,1);    BND.Y(:,1) = Yc(:,1);
+BND.X(:,I) = Xc(:,end);  BND.Y(:,I) = Yc(:,end);
+
+% corners
 BND.X(1,1)=Xc(1,1);         BND.Y(1,1)=Yc(1,1);
 BND.X(1,I)=Xc(1,end);       BND.Y(1,I)=Yc(1,end);
 BND.X(J,1)=Xc(end,1);       BND.Y(J,1)=Yc(end,1);
 BND.X(J,I)=Xc(end,end);     BND.Y(J,I)=Yc(end,end);
 
-% logical coordinates (for basis on [0,1]^2)
-sb = linspace(0,1,I); sl = linspace(0,1,J).';
-
-%% ==================== Sylvester operators & RHS stencils ==================
-eI = ones(nI,1); eJ = ones(nJ,1);
-Ts = spdiags([-eI 2*eI -eI], [-1 0 1], nI, nI);  % s-Laplacian (Dirichlet)
-Tt = spdiags([-eJ 2*eJ -eJ], [-1 0 1], nJ, nJ);  % t-Laplacian (Dirichlet)
-
-bFxL = BND.X(2:J-1, 1);   bFyL = BND.Y(2:J-1, 1);
-bFxR = BND.X(2:J-1, I);   bFyR = BND.Y(2:J-1, I);
-bFxB = BND.X(1, 2:I-1);   bFyB = BND.Y(1, 2:I-1);
-bFxT = BND.X(J, 2:I-1);   bFyT = BND.Y(J, 2:I-1);
-
-%% ==================== Make bubble mode lists =============================
-modes_X = make_modes(Kx_desired, mode_order);
-modes_Y = make_modes(Ky_desired, mode_order);
-
-if print_modes
-    fprintf('Using %d X-basis and %d Y-basis functions.\n', size(modes_X,1), size(modes_Y,1));
-    fprintf('modes_X = %s\n', mat2str(modes_X));
-    fprintf('modes_Y = %s\n\n', mat2str(modes_Y));
+%% ===== Bubble basis (m+n ordering): sin(pi*m*s)sin(pi*n*t) =====
+[sgrid, tgrid] = meshgrid(linspace(0,1,I), linspace(0,1,J));
+modes = makeModes_mplusn(Nbasis);
+basisFns = cell(Nbasis,1);
+for k = 1:Nbasis
+    m = modes(k,1); n = modes(k,2);
+    basisFns{k} = sin(pi*m*sgrid).*sin(pi*n*tgrid);
 end
 
-%% ==================== Build bases & center-derivatives ===================
-[sgrid, tgrid] = meshgrid(sb, sl);   % JxI
+%% ===== Stage 1: Optimize C using generalized solver with A=B=0 =====
+A0 = zeros(Nbasis,1);
+B0 = zeros(Nbasis,1);
 
-Kx = size(modes_X,1); Ky = size(modes_Y,1);
+fC = @(C) objectiveGeneralized(C, A0, B0);
+[C_opt, ~] = brentMin(fC, C_bracket(1), C_bracket(2), C_tol);
+fprintf('C_opt = %.8f (optimized using generalized solver, A=B=0)\n', C_opt);
 
-F1 = cell(Kx,1);  F1s_c = cell(Kx,1);  F1t_c = cell(Kx,1);
-F2 = cell(Ky,1);  F2s_c = cell(Ky,1);  F2t_c = cell(Ky,1);
-
-center_derivs = @(F) deal( ...
-    (F(:,3:end)-F(:,1:end-2))/(2*hs), ...  % *_s (J x (I-2))
-    (F(3:end,:)-F(1:end-2,:))/(2*ht) ...   % *_t ((J-2) x I)
-);
-
-for k = 1:Kx
-    m = modes_X(k,1); n = modes_X(k,2);
-    F = sin(m*pi*sgrid).*sin(n*pi*tgrid);      % zero on boundaries
-    [Fs, Ft] = center_derivs(F);
-    F1{k}    = F;
-    F1s_c{k} = Fs(2:end-1,:);                  % (J-2) x (I-2)
-    F1t_c{k} = Ft(:,2:end-1);                  % (J-2) x (I-2)
-end
-for k = 1:Ky
-    m = modes_Y(k,1); n = modes_Y(k,2);
-    F = sin(m*pi*sgrid).*sin(n*pi*tgrid);
-    [Fs, Ft] = center_derivs(F);
-    F2{k}    = F;
-    F2s_c{k} = Fs(2:end-1,:);
-    F2t_c{k} = Ft(:,2:end-1);
+%% ===== Stage 2: Optimize A,B using stochastic coordinate FD updates =====
+if Nbasis == 0
+    Aopt = zeros(0,1); Bopt = zeros(0,1);
+else
+    z0 = zeros(2*Nbasis,1); % z=[A;B]
+    fAB = @(z) objectiveGeneralized(C_opt, z(1:Nbasis), z(Nbasis+1:end));
+    [zopt, E_opt] = sgdCoordFD(fAB, z0, sgd);
+    Aopt = zopt(1:Nbasis);
+    Bopt = zopt(Nbasis+1:end);
 end
 
-% Normalize by derivative RMS (optional)
-if normalize_basis
-    for k = 1:Kx
-        sc = sqrt(mean(F1s_c{k}(:).^2 + F1t_c{k}(:).^2));
-        if sc>0, F1{k}=F1{k}/sc; F1s_c{k}=F1s_c{k}/sc; F1t_c{k}=F1t_c{k}/sc; end
-    end
-    for k = 1:Ky
-        sc = sqrt(mean(F2s_c{k}(:).^2 + F2t_c{k}(:).^2));
-        if sc>0, F2{k}=F2{k}/sc; F2s_c{k}=F2s_c{k}/sc; F2t_c{k}=F2t_c{k}/sc; end
-    end
-end
+% Final grid + final energy (computed at final A,B)
+[Xopt, Yopt] = solveGeneralizedLengthGrid(C_opt, BND, Aopt, Bopt, basisFns, epsDen);
+E_opt = objectiveGeneralized(C_opt, Aopt, Bopt);
 
-cellArea = hs*ht;
+fprintf('Final E_opt (NH + penalties) = %.6e\n', E_opt);
 
-%% ==================== Warm start for inner BFGS ==========================
-last_z = zeros(Kx+Ky,1);   % captured by nested functions
+%% ===== Jacobian at cell centers =====
+[xs, ys, xt, yt] = metricsCentered(Xopt, Yopt, hs, ht);
+Jc = xs.*yt - xt.*ys;
+fprintf('min(Jc) = %.6e\n', min(Jc(:)));
 
-%% ==================== Outer Brent on C; inner BFGS on (a,b) ==============
-energy_at_C = @(C) inner_opt(C);   % nested (captures last_z)
+%% ===== Build optimal reference grid =====
+[Uopt, Vopt] = buildReferenceGrid(C_opt, Aopt, Bopt, basisFns, I, J);
 
-opts_b = optimset('TolX',1e-3,'Display','iter');
-[C_opt, E_opt] = fminbnd(@(C) energy_at_C(C), C_bracket(1), C_bracket(2), opts_b);
-
-% Final inner solve at C* to fetch (a*,b*) and final grid
-[z_star, ~] = bfgs(@(z) energy_grad_coeffs(C_opt, z), last_z, struct('display',true));
-a_opt = z_star(1:Kx);  b_opt = z_star(Kx+1:end);
-[~, ~, ~, Xopt, Yopt, Jc] = energy_grad_coeffs(C_opt, z_star);
-
-fprintf('\nBest C ≈ %.6f\nTotal energy ≈ %.6e\nMin Jacobian ≈ %.3e\n', C_opt, E_opt, min(Jc(:)));
-fprintf('||a||_2=%.3e, ||b||_2=%.3e\n', norm(a_opt), norm(b_opt));
-
-if print_modes
-    fprintf('\nOptimized X modes [m n a]: %s\n', mat2str([modes_X, a_opt(:)], 6));
-    fprintf('Optimized Y modes [m n b]: %s\n\n', mat2str([modes_Y, b_opt(:)], 6));
-end
-
-%% ==================== Plotting ===========================================
+%% ===== Plot final physical grid =====
 figure; hold on; axis equal; box on;
-for j=1:J, plot(Xopt(j,:),Yopt(j,:),'-'); end
-for i=1:I, plot(Xopt(:,i),Yopt(:,i),'-'); end
-title(sprintf('Boundary for grid: C*=%.3f, BFGS-optimized bubbles (N_x=%d, N_y=%d)', C_opt, Kx, Ky));
-xlabel('x'); ylabel('y');
+for j=1:J, plot(Xopt(j,:), Yopt(j,:), '-k'); end
+for i=1:I, plot(Xopt(:,i), Yopt(:,i), '-k'); end
+title(sprintf('Physical grid (C*=%.4f, Nbasis=%d)', C_opt, Nbasis));
+xlabel('X'); ylabel('Y');
 
+%% ===== Plot Jacobian heatmap =====
 figure; imagesc(Jc); axis image; colorbar;
 title('Jacobian det J at cell centers'); xlabel('i'); ylabel('j');
 
-%% ==================== Nested helpers =====================================
-    function modes = make_modes(K, order)
-        % Generate K pairs (m,n) with m,n>=1, in chosen order.
-        % 'radial': by m^2+n^2 (ties by m then n).
-        % 'lexico': by m, then n.
-        maxM = ceil(2 + sqrt(K)*2);  % crude envelope
-        cand = [];
-        for m = 1:maxM
-            for n = 1:maxM
-                cand = [cand; m, n, m*m+n*n]; %#ok<AGROW>
-            end
-        end
-        switch lower(order)
-            case 'radial'
-                [~,idx] = sortrows(cand,[3 1 2]); % by radius^2, then m,n
-            case 'lexico'
-                [~,idx] = sortrows(cand,[1 2]);   % by m, then n
-            otherwise
-                error('Unknown mode_order: %s', order);
-        end
-        modes = cand(idx(1:K),1:2);
+%% ===== Plot optimal reference grid (u,v) =====
+figure; hold on; axis equal; box on;
+for j=1:J, plot(Uopt(j,:), Vopt(j,:), '-b'); end
+for i=1:I, plot(Uopt(:,i), Vopt(:,i), '-b'); end
+title(sprintf('Reference grid (u,v), C*=%.4f, Nbasis=%d', C_opt, Nbasis));
+xlabel('u'); ylabel('v');
+
+%% ===== Overlay reference vs physical =====
+figure; hold on; axis equal; box on;
+for j=1:J, plot(Uopt(j,:), Vopt(j,:), 'b-'); end
+for i=1:I, plot(Uopt(:,i), Vopt(:,i), 'b-'); end
+for j=1:J, plot(Xopt(j,:), Yopt(j,:), 'k-'); end
+for i=1:I, plot(Xopt(:,i), Yopt(:,i), 'k-'); end
+legend('ref rows','ref cols','phys rows','phys cols');
+title('Reference (blue) vs Physical (black)');
+xlabel('x/u'); ylabel('y/v');
+
+%% ===== nested objective =====
+    function E = objectiveGeneralized(C, A, B)
+        [X, Y] = solveGeneralizedLengthGrid(C, BND, A, B, basisFns, epsDen);
+
+        % Base NH energy
+        E_NH = neoHookeanEnergy(X, Y, hs, ht, mu, lambda, epsJ, kappa);
+
+        % Penalties
+        E_orth = orthogonalityPenalty(X, Y, hs, ht);
+        E_ar   = aspectRatioPenalty(X, Y, hs, ht);
+
+        % Total (plus mild AB regularization)
+        E = E_NH + gammaOrth*E_orth + gammaAR*E_ar + betaAB*(sum(A.^2)+sum(B.^2));
+    end
+end
+
+
+%% =======================================================================
+%% Build reference grid u,v on parameter grid
+function [U, V] = buildReferenceGrid(C, A, B, basisFns, I, J)
+    [sgrid, tgrid] = meshgrid(linspace(0,1,I), linspace(0,1,J));
+    U = sgrid;
+    V = C*tgrid;
+    for k = 1:numel(A)
+        if isempty(basisFns{k}), continue; end
+        U = U + A(k)*basisFns{k};
+        V = V + B(k)*basisFns{k};
+    end
+end
+
+
+%% =======================================================================
+%% Generalized-length solver (denominator squared), SAME operator for X and Y
+function [X, Y] = solveGeneralizedLengthGrid(C, BND, A, B, basisFns, epsDen)
+    [J,I] = size(BND.X);
+    nI = I-2; nJ = J-2;
+    N  = nI*nJ;
+
+    [sgrid, tgrid] = meshgrid(linspace(0,1,I), linspace(0,1,J));
+    u = sgrid;
+    v = C*tgrid;
+
+    for k=1:numel(A)
+        if isempty(basisFns{k}), continue; end
+        u = u + A(k)*basisFns{k};
+        v = v + B(k)*basisFns{k};
     end
 
-    function E = inner_opt(C)
-        bfgs_opts.maxIter = 200;
-        bfgs_opts.tolGrad = 1e-6;
-        bfgs_opts.tolStep = 1e-10;
-        bfgs_opts.display = false;
-        [z_opt, E] = bfgs(@(z) energy_grad_coeffs(C, z), last_z, bfgs_opts);
-        last_z = z_opt;   % warm start for next C
-    end
+    du_h = u(:,2:end) - u(:,1:end-1);    % J x (I-1)
+    dv_h = v(:,2:end) - v(:,1:end-1);
+    du_v = u(2:end,:) - u(1:end-1,:);    % (J-1) x I
+    dv_v = v(2:end,:) - v(1:end-1,:);
 
-    function [X, Y] = base_grid_from_C(C)
-        wx = 1/(hs^2);             % A=1
-        wy = 1/((C^2)*ht^2);
-        Aop = wy * full(Tt);
-        Bop = wx * full(Ts);
+    % Smooth floor: den = den + epsDen (avoids kinks from max())
+    den_h = (du_h.^2 + dv_h.^2) + epsDen;
+    den_v = (du_v.^2 + dv_v.^2) + epsDen;
 
-        Fx = zeros(nJ,nI);  Fy = zeros(nJ,nI);
-        Fx(:,1)   = Fx(:,1)   + wx * bFxL;   Fy(:,1)   = Fy(:,1)   + wx * bFyL;
-        Fx(:,end) = Fx(:,end) + wx * bFxR;   Fy(:,end) = Fy(:,end) + wx * bFyR;
-        Fx(1,:)   = Fx(1,:)   + wy * bFxB;   Fy(1,:)   = Fy(1,:)   + wy * bFyB;
-        Fx(end,:) = Fx(end,:) + wy * bFxT;   Fy(end,:) = Fy(end,:) + wy * bFyT;
+    Wh = 1 ./ den_h;
+    Wv = 1 ./ den_v;
 
-        Ux = sylvester(Aop, Bop, Fx);
-        Uy = sylvester(Aop, Bop, Fy);
+    idx = @(ii,jj) (jj-1)*nI + ii;
 
-        % Sanity: sizes must be (J-2)x(I-2)
-        assert(isequal(size(Ux), [J-2, I-2]), 'Ux size mismatch');
-        assert(isequal(size(Uy), [J-2, I-2]), 'Uy size mismatch');
+    ii = zeros(5*N,1);
+    jj = zeros(5*N,1);
+    ss = zeros(5*N,1);
+    bX = zeros(N,1);
+    bY = zeros(N,1);
+    ptr = 0;
 
-        X = BND.X;  Y = BND.Y;
-        X(2:J-1,2:I-1) = Ux;
-        Y(2:J-1,2:I-1) = Uy;
-    end
+    for jj_int = 1:nJ
+        jg = jj_int + 1;
+        for ii_int = 1:nI
+            ig  = ii_int + 1;
+            row = idx(ii_int, jj_int);
 
-    function [xs, ys, xt, yt, Jc] = metrics(X, Y)
-        x_s = (X(:,3:end)-X(:,1:end-2))/(2*hs);
-        y_s = (Y(:,3:end)-Y(:,1:end-2))/(2*hs);
-        x_t = (X(3:end,:)-X(1:end-2,:))/(2*ht);
-        y_t = (Y(3:end,:)-Y(1:end-2,:))/(2*ht);
-        xs = x_s(2:end-1,:);  ys = y_s(2:end-1,:);
-        xt = x_t(:,2:end-1);  yt = y_t(:,2:end-1);
-        Jc = xs.*yt - xt.*ys;
-    end
+            Ww = Wh(jg, ig-1);
+            We = Wh(jg, ig);
+            Ws = Wv(jg-1, ig);
+            Wn = Wv(jg, ig);
 
-    function [E, g, minJ, Xfull, Yfull, Jc] = energy_grad_coeffs(C, z)
-        % z = [a(1:Kx); b(1:Ky)]
-        a = z(1:Kx); b = z(Kx+1:end);
+            diagv = Ww + We + Ws + Wn;
 
-        [X0, Y0] = base_grid_from_C(C);
-        [xs, ys, xt, yt, Jc] = metrics(X0, Y0);
+            ptr=ptr+1; ii(ptr)=row; jj(ptr)=row; ss(ptr)=diagv;
 
-        % Add basis contributions directly to metrics
-        for k = 1:Kx, xs = xs + a(k)*F1s_c{k}; xt = xt + a(k)*F1t_c{k}; end
-        for k = 1:Ky, ys = ys + b(k)*F2s_c{k}; yt = yt + b(k)*F2t_c{k}; end
-
-        % Smooth barrier & energy
-        Jsafe = max(Jc, epsJ);
-        logJ  = log(Jsafe);
-        d = 2;
-        trC = xs.^2 + ys.^2 + xt.^2 + yt.^2;
-        W = 0.5*mu*(trC - d) - mu*logJ + 0.5*lambda*(logJ.^2);
-
-        r = max(0, epsJ - Jc);
-        B = kappa * (r.^2);
-
-        E = cellArea * sum(W(:) + B(:)) + beta_reg*(sum(a.^2)+sum(b.^2));
-        minJ = min(Jc(:));
-
-        % Gradients wrt xs,xt,ys,yt
-        common = (-mu + lambda*logJ) ./ Jsafe;
-        dW_dxs = mu*xs + common .* (yt);
-        dW_dxt = mu*xt + common .* (-ys);
-        dW_dys = mu*ys + common .* (-xt);
-        dW_dyt = mu*yt + common .* (xs);
-
-        % Barrier gradient
-        active = (Jc < epsJ);
-        T = zeros(size(Jc)); T(active) = -2*kappa .* (epsJ - Jc(active));
-        dW_dxs = dW_dxs + T .* (yt);
-        dW_dxt = dW_dxt + T .* (-ys);
-        dW_dys = dW_dys + T .* (-xt);
-        dW_dyt = dW_dyt + T .* (xs);
-
-        % Assemble ∇ wrt a_k and b_k
-        g = zeros(Kx+Ky,1);
-        for k = 1:Kx
-            g(k) = cellArea * sum( dW_dxs(:).*F1s_c{k}(:) + dW_dxt(:).*F1t_c{k}(:) ) ...
-                   + 2*beta_reg*a(k);
-        end
-        for k = 1:Ky
-            g(Kx+k) = cellArea * sum( dW_dys(:).*F2s_c{k}(:) + dW_dyt(:).*F2t_c{k}(:) ) ...
-                      + 2*beta_reg*b(k);
-        end
-
-        % Full grid for end-of-run visualization
-        if nargout >= 4
-            Xfull = X0; Yfull = Y0;
-            for k = 1:Kx, Xfull = Xfull + a(k)*F1{k}; end
-            for k = 1:Ky, Yfull = Yfull + b(k)*F2{k}; end
-        end
-    end
-
-    function [z, f] = bfgs(fun, z0, opts)
-        % Safe names (no collision with grid 'I'/'J' or mode index 'n')
-        if ~isfield(opts,'maxIter'),  opts.maxIter = 200; end
-        if ~isfield(opts,'tolGrad'),  opts.tolGrad = 1e-6; end
-        if ~isfield(opts,'tolStep'),  opts.tolStep = 1e-12; end
-        if ~isfield(opts,'c1'),       opts.c1 = 1e-4; end
-        if ~isfield(opts,'rho'),      opts.rho = 0.5; end
-        if ~isfield(opts,'display'),  opts.display = true; end
-
-        z = z0(:);
-        [f, g] = fun(z);
-        nv = numel(z);
-        H  = eye(nv);
-
-        for it = 1:opts.maxIter
-            if opts.display
-                fprintf('  BFGS iter %3d: f=%.6e  ||g||_inf=%.3e\n', it, f, norm(g,inf));
-            end
-            if norm(g,inf) < opts.tolGrad, break; end
-
-            p = -H*g; if g'*p >= 0, p = -g; end
-
-            % Armijo backtracking
-            t = 1.0; f0 = f; g0 = g;
-            while true
-                ztrial = z + t*p;
-                [ftrial, gtrial] = fun(ztrial);
-                if ftrial <= f0 + opts.c1*t*(g0'*p) || t < 1e-16, break; end
-                t = t * opts.rho;
-            end
-
-            s = t*p;
-            z = z + s;
-            y = gtrial - g;
-            f = ftrial; g = gtrial;
-
-            ys = y'*s;
-            if ys <= 1e-12
-                H = eye(nv);
+            % west
+            if ii_int > 1
+                ptr=ptr+1; ii(ptr)=row; jj(ptr)=idx(ii_int-1,jj_int); ss(ptr)=-Ww;
             else
-                Id  = eye(nv);
-                rhoB = 1/ys;
-                V   = Id - rhoB*(s*y');
-                H   = V*H*V' + rhoB*(s*s');
+                bX(row) = bX(row) + Ww * BND.X(jg,1);
+                bY(row) = bY(row) + Ww * BND.Y(jg,1);
             end
 
-            if norm(s,inf) < opts.tolStep, break; end
+            % east
+            if ii_int < nI
+                ptr=ptr+1; ii(ptr)=row; jj(ptr)=idx(ii_int+1,jj_int); ss(ptr)=-We;
+            else
+                bX(row) = bX(row) + We * BND.X(jg,I);
+                bY(row) = bY(row) + We * BND.Y(jg,I);
+            end
+
+            % south
+            if jj_int > 1
+                ptr=ptr+1; ii(ptr)=row; jj(ptr)=idx(ii_int,jj_int-1); ss(ptr)=-Ws;
+            else
+                bX(row) = bX(row) + Ws * BND.X(1,ig);
+                bY(row) = bY(row) + Ws * BND.Y(1,ig);
+            end
+
+            % north
+            if jj_int < nJ
+                ptr=ptr+1; ii(ptr)=row; jj(ptr)=idx(ii_int,jj_int+1); ss(ptr)=-Wn;
+            else
+                bX(row) = bX(row) + Wn * BND.X(J,ig);
+                bY(row) = bY(row) + Wn * BND.Y(J,ig);
+            end
         end
     end
+
+    Aop = sparse(ii(1:ptr), jj(1:ptr), ss(1:ptr), N, N);
+
+    Xvec = Aop \ bX;
+    Yvec = Aop \ bY;
+
+    X = BND.X; Y = BND.Y;
+    X(2:end-1,2:end-1) = reshape(Xvec, [nI,nJ])';
+    Y(2:end-1,2:end-1) = reshape(Yvec, [nI,nJ])';
+end
+
+
+%% =======================================================================
+%% Neo-Hookean energy (2D) with barrier
+function E = neoHookeanEnergy(X, Y, hs, ht, mu, lambda, epsJ, kappa)
+    cellArea = hs*ht;
+
+    [xs, ys, xt, yt] = metricsCentered(X, Y, hs, ht);
+    Jc = xs.*yt - xt.*ys;
+
+    Jsafe = max(Jc, epsJ);
+    logJ  = log(Jsafe);
+
+    d = 2;
+    trC = xs.^2 + ys.^2 + xt.^2 + yt.^2;
+    W = 0.5*mu*(trC - d) - mu*logJ + 0.5*lambda*(logJ.^2);
+
+    r = max(0, epsJ - Jc);
+    B = kappa*(r.^2);
+
+    E = cellArea * sum(W(:) + B(:));
+end
+
+
+%% =======================================================================
+%% Orthogonality penalty: ∫ (Xs·Xt)^2
+function Eorth = orthogonalityPenalty(X, Y, hs, ht)
+    [xs, ys, xt, yt] = metricsCentered(X, Y, hs, ht);
+    orth = xs.*xt + ys.*yt;
+    Eorth = (hs*ht) * sum(orth(:).^2);
+end
+
+
+%% =======================================================================
+%% Aspect ratio penalty: ∫ log(||Xs||^2 / ||Xt||^2)^2
+function Ear = aspectRatioPenalty(X, Y, hs, ht)
+    [xs, ys, xt, yt] = metricsCentered(X, Y, hs, ht);
+    a = xs.^2 + ys.^2;
+    b = xt.^2 + yt.^2;
+    epsr = 1e-12;
+    r = log((a+epsr)./(b+epsr));
+    Ear = (hs*ht) * sum(r(:).^2);
+end
+
+
+%% =======================================================================
+%% Centered metrics at cell centers (J-2 x I-2)
+function [xs, ys, xt, yt] = metricsCentered(X, Y, hs, ht)
+    x_s = (X(:,3:end)-X(:,1:end-2))/(2*hs);
+    y_s = (Y(:,3:end)-Y(:,1:end-2))/(2*hs);
+    x_t = (X(3:end,:)-X(1:end-2,:))/(2*ht);
+    y_t = (Y(3:end,:)-Y(1:end-2,:))/(2*ht);
+
+    xs = x_s(2:end-1,:);
+    ys = y_s(2:end-1,:);
+    xt = x_t(:,2:end-1);
+    yt = y_t(:,2:end-1);
+end
+
+
+%% =======================================================================
+%% Modes ordered by m+n (low frequency first)
+function modes = makeModes_mplusn(N)
+    if N <= 0
+        modes = zeros(0,2);
+        return;
+    end
+    modes = zeros(N,2);
+    k = 0;
+    nsum = 2;
+    while k < N
+        for m = 1:(nsum-1)
+            n = nsum - m;
+            if n >= 1
+                k = k + 1;
+                modes(k,:) = [m n];
+                if k == N, break; end
+            end
+        end
+        nsum = nsum + 1;
+    end
+end
+
+
+%% =======================================================================
+%% Stochastic coordinate descent with FD gradients (SGD-like)
+function [z, fz] = sgdCoordFD(f, z0, opts)
+    if ~isfield(opts,'maxIter'), opts.maxIter = 500; end
+    if ~isfield(opts,'batchK'),  opts.batchK  = 6; end
+    if ~isfield(opts,'fdStep'),  opts.fdStep  = 1e-4; end
+    if ~isfield(opts,'lr0'),     opts.lr0     = 0.1; end
+    if ~isfield(opts,'decay'),   opts.decay   = 1e-3; end
+    if ~isfield(opts,'displayEvery'), opts.displayEvery = 25; end
+
+    z = z0(:);
+    fz = f(z);
+
+    n = numel(z);
+    K = min(opts.batchK, n);
+
+    for it = 1:opts.maxIter
+        lr = opts.lr0 / (1 + opts.decay*it);
+
+        idxs = randperm(n, K);
+        ghat = zeros(n,1);
+
+        for kk = 1:K
+            i = idxs(kk);
+            hi = opts.fdStep * max(1, abs(z(i)));
+            zp = z; zm = z;
+            zp(i) = zp(i) + hi;
+            zm(i) = zm(i) - hi;
+            ghat(i) = (f(zp) - f(zm)) / (2*hi);
+        end
+
+        z_new = z - lr*ghat;
+        f_new = f(z_new);
+
+        if f_new <= fz
+            z = z_new; fz = f_new;
+        else
+            % one-step shrink safeguard
+            lr2 = 0.5*lr;
+            z_new = z - lr2*ghat;
+            f_new = f(z_new);
+            if f_new <= fz
+                z = z_new; fz = f_new;
+            end
+        end
+
+        if mod(it, opts.displayEvery) == 0
+            fprintf('SCD iter %4d: f=%.6e  lr=%.3e  K=%d\n', it, fz, lr, K);
+        end
+    end
+end
+
+
+%% =======================================================================
+%% Brent minimizer for scalar f on [a,b]
+function [xopt, fopt] = brentMin(f, a, b, tol)
+    if nargin < 4, tol = 1e-6; end
+    phi  = (3 - sqrt(5))/2;
+    eps0 = 1e-12;
+
+    x = a + phi*(b-a);
+    w = x; v = x;
+    fx = f(x); fw = fx; fv = fx;
+    d = 0; e = 0;
+
+    while (b-a) > tol
+        m = 0.5*(a+b);
+        tol1 = tol*abs(x) + eps0;
+        tol2 = 2*tol1;
+
+        if abs(x-m) <= (tol2 - 0.5*(b-a))
+            break;
+        end
+
+        p = 0; q = 0; r = 0;
+
+        if abs(x-w) > eps0 && abs(x-v) > eps0 && abs(w-v) > eps0
+            r = (x-w)*(fx-fv);
+            q = (x-v)*(fx-fw);
+            p = (x-v)*q - (x-w)*r;
+            q = 2*(q-r);
+            if q > 0, p = -p; end
+            q = abs(q);
+
+            if abs(p) < abs(0.5*q*e) && p > q*(a-x) && p < q*(b-x)
+                d = p/q;
+                u = x + d;
+                if (u-a) < tol2 || (b-u) < tol2
+                    d = sign(m-x)*tol1;
+                end
+            else
+                if x < m, e = b-x; else, e = a-x; end
+                d = phi*e;
+            end
+        else
+            if x < m, e = b-x; else, e = a-x; end
+            d = phi*e;
+        end
+
+        if abs(d) >= tol1
+            u = x + d;
+        else
+            u = x + sign(d)*tol1;
+        end
+
+        fu = f(u);
+
+        if fu <= fx
+            if u < x, b = x; else, a = x; end
+            v = w; fv = fw;
+            w = x; fw = fx;
+            x = u; fx = fu;
+        else
+            if u < x, a = u; else, b = u; end
+            if fu <= fw || w == x
+                v = w; fv = fw;
+                w = u; fw = fu;
+            elseif fu <= fv || v == x || v == w
+                v = u; fv = fu;
+            end
+        end
+    end
+
+    xopt = x;
+    fopt = fx;
 end
