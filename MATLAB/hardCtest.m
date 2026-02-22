@@ -1,71 +1,72 @@
-%% test_hardc_ref_grid
-% Script to test gridGenerator
+%% test_hardC_softmax_gridGenerator
+% Script to test the *softmax-reclustering* version of gridGenerator on Hard-C
 clc; clear; close all;
 
-% Add Grids folder to path (where makeGridHardC.m lives)
-addpath(fullfile(pwd,'Grids'));
+% Robust path setup (so pwd doesn't matter)
+thisDir = fileparts(mfilename('fullpath'));
+addpath(thisDir);
+addpath(fullfile(thisDir,'Grids'));
 
 %% --- Parameters ---
-Ns = 23;       % # columns (s-direction)  (I)
-Nt = 40;       % # rows    (t-direction)  (J)
-N_basis = 0 ;  % # bubble basis functions
+Ns = 41;        % # columns (s-direction)
+Nt = 41;        % # rows    (t-direction)
+
+% NOTE: In the modified gridGenerator, this is interpreted as:
+%   N_basis = number of SGD steps for softmax reclustering
+N_basis = 1000;  % try 100..1000
 
 %% --- Grid function handle ---
-grid_fun = @makeGridHardC;  % should accept (Ns-1, Nt-1) and return X,Y on boundary grid
+grid_fun = @makeGridHardC;   % must return [X,Y] of size Nt x Ns
 
-%% --- Quick sanity check on grid_fun output sizes ---
-try
-    [Xc, Yc] = grid_fun(Ns-1, Nt-1);
-catch ME
-    error('grid_fun failed when called as grid_fun(Ns-1, Nt-1). Error:\n%s', ME.message);
-end
-
+%% --- Sanity check (optional but useful) ---
+[Xc, Yc] = grid_fun(Ns-1, Nt-1);
 fprintf('grid_fun returned size(Xc)=%s, size(Yc)=%s\n', mat2str(size(Xc)), mat2str(size(Yc)));
 
-% Many implementations return (Nt x Ns). We want boundary arrays consistent with Nt,Ns.
-% If yours returns (Ns x Nt), transpose them here.
 if ~isequal(size(Xc), [Nt, Ns]) && isequal(size(Xc), [Ns, Nt])
     warning('grid_fun returned (Ns x Nt). Transposing to (Nt x Ns).');
     Xc = Xc.'; Yc = Yc.';
 end
-
 if ~isequal(size(Xc), [Nt, Ns])
-    warning(['Expected grid_fun to return size (Nt x Ns) = (%d x %d). ' ...
-             'Got %s. gridGenerator may error unless its boundary assembly matches this.'], ...
-             Nt, Ns, mat2str(size(Xc)));
+    warning('Expected (Nt x Ns) = (%d x %d), got %s. Proceeding anyway...', Nt, Ns, mat2str(size(Xc)));
 end
 
-%% --- Run gridGenerator ---
-try
-    [C_opt, E_opt, Xopt, Yopt, Jc, Aopt, Bopt] = gridGenerator(grid_fun, Ns, Nt, N_basis);
-catch ME
-    disp(ME.getReport('extended'));
-    error('gridGenerator failed. See error report above.');
-end
+%% --- Run the optimization (plots are produced by gridGenerator itself) ---
+% The modified gridGenerator returns and plots:
+%   - Physical grid
+%   - Jacobian heatmap
+%   - Reference (u,v) grid
+%   - Overlay reference vs physical
+[C_opt, E_opt, Xopt, Yopt, Jc, pU_opt, pV_opt, Uopt, Vopt] = gridGenerator(grid_fun, Ns, Nt, N_basis);
 
 %% --- Print results ---
 fprintf('\nRESULTS:\n');
 fprintf('  C_opt   = %.8f\n', C_opt);
-fprintf('  E_opt   = %.6e (generalized solver NH energy)\n', E_opt);
+fprintf('  E_opt   = %.6e\n', E_opt);
 fprintf('  min(Jc) = %.3e\n', min(Jc(:)));
 
-if ~isempty(Aopt)
-    fprintf('  ||A||_2 = %.3e, ||B||_2 = %.3e\n', norm(Aopt), norm(Bopt));
-end
+%% --- Extra plots (optional): spacing distributions in the reclustered reference grid ---
+% pU_opt and pV_opt are logits; convert to spacings
+dU = softmax_local(pU_opt(:));
+dV = softmax_local(pV_opt(:));
+dU = dU / sum(dU);
+dV = dV / sum(dV) * C_opt;
 
-%% --- Plot final grid (if you want an extra plot) ---
-figure; hold on; axis equal; box on;
-for j=1:Nt
-    plot(Xopt(j,:), Yopt(j,:), '-k');
-end
-for i=1:Ns
-    plot(Xopt(:,i), Yopt(:,i), '-k');
-end
-title(sprintf('Final grid (C*=%.4f, Nbasis=%d)', C_opt, N_basis));
-xlabel('X'); ylabel('Y');
+figure; subplot(2,1,1);
+plot(dU,'-o'); grid on;
+title('Reference spacings dU (sum=1)'); xlabel('i'); ylabel('\Delta U_i');
 
-%% --- Plot Jacobian heatmap ---
-figure;
-imagesc(Jc); axis image; colorbar;
-title('Jacobian det J at cell centers');
-xlabel('i'); ylabel('j');
+subplot(2,1,2);
+plot(dV,'-o'); grid on;
+title(sprintf('Reference spacings dV (sum=C=%.4f)', C_opt)); xlabel('j'); ylabel('\Delta V_j');
+
+%% --- Local softmax (uses built-in if available) ---
+function y = softmax_local(x)
+x = x(:);
+if exist('softmax','file') == 2
+    y = softmax(x);
+else
+    x = x - max(x);
+    ex = exp(x);
+    y = ex / sum(ex);
+end
+end

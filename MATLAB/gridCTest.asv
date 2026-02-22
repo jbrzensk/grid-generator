@@ -1,0 +1,65 @@
+%% test_softC_sinkhorn
+
+clc; clear; close all;
+
+% Robust path setup (so pwd doesn't matter)
+thisDir = fileparts(mfilename('fullpath'));
+addpath(thisDir);
+addpath(fullfile(thisDir,'Grids'));
+
+%% --- Parameters ---
+Ns = 41;        % # columns (s-direction)
+Nt = 41;        % # rows    (t-direction)
+N_outer = 25;   % # Sinkhorn outer iterations (try 10..50)
+
+%% --- Grid function handle ---
+grid_fun = @makeGridC;   % must return [X,Y] of size Nt x Ns when called as (Ns-1,Nt-1)
+
+%% --- Sanity check on grid_fun output sizes ---
+[Xc, Yc] = grid_fun(Ns-1, Nt-1);
+fprintf('grid_fun returned size(Xc)=%s, size(Yc)=%s\n', mat2str(size(Xc)), mat2str(size(Yc)));
+
+if ~isequal(size(Xc), [Nt, Ns]) && isequal(size(Xc), [Ns, Nt])
+    warning('grid_fun returned (Ns x Nt). Transposing to (Nt x Ns).');
+    Xc = Xc.'; Yc = Yc.';
+end
+if ~isequal(size(Xc), [Nt, Ns])
+    warning('Expected (Nt x Ns)=(%d x %d), got %s. Proceeding anyway...', Nt, Ns, mat2str(size(Xc)));
+end
+
+%% --- Run the Sinkhorn reclustering method ---
+% Make sure gridGenerator_method1_sinkhorn.m is on your path (same folder as this script is easiest).
+[C_opt, E_opt, Xopt, Yopt, Jc, Aopt, Bopt, Uopt, Vopt] = gridGenerator(grid_fun, Ns, Nt, N_outer);
+
+%% --- Print results ---
+fprintf('\nRESULTS:\n');
+fprintf('  C_opt   = %.6f\n', C);
+fprintf('  E_opt   = %.6e\n', E);
+fprintf('  min(Jc) = %.3e\n', min(Jc(:)));
+if isfield(info,'minq')
+    fprintf('  min scaled Jacobian (last) = %.3e\n', info.minq(end));
+end
+
+%% --- Extra plots (optional): spacings implied by pU,pV ---
+% pU = log(dU), pV = log(dV/C)
+dU = exp(pU(:)); dU = dU / sum(dU);
+dV = exp(pV(:)); dV = dV / sum(dV) * C;
+
+figure;
+subplot(2,1,1);
+plot(dU,'-o'); grid on;
+title('Reference spacings dU (sum=1)'); xlabel('i'); ylabel('\Delta U_i');
+
+subplot(2,1,2);
+plot(dV,'-o'); grid on;
+title(sprintf('Reference spacings dV (sum=C=%.4f)', C)); xlabel('j'); ylabel('\Delta V_j');
+
+%% --- Extra plot: energy / minq history ---
+if isfield(info,'Ehist') && any(isfinite(info.Ehist))
+    figure; plot(info.Ehist,'-o'); grid on;
+    title('Reporting energy history (NH/Winslow mix)'); xlabel('outer iteration'); ylabel('E');
+end
+if isfield(info,'minq')
+    figure; plot(info.minq,'-o'); grid on;
+    title('min scaled Jacobian history'); xlabel('outer iteration'); ylabel('min(q)');
+end
