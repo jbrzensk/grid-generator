@@ -8,7 +8,7 @@ addpath(fullfile(thisDir,'Grids'));
 %% --- Parameters ---
 Ns = 41;
 Nt = 41;
-N_outer = 0;   % number of ACCEPTED SGD steps (with filter)
+N_outer = 005;   % number of ACCEPTED SGD steps (with filter)
 
 %% --- Grid function handle ---
 grid_fun = @makeGridC;   % <-- change to @makeGridC if you really want the C-grid

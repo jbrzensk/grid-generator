@@ -1,17 +1,14 @@
 function [C_opt, E_opt, Xopt, Yopt, Jc, pUopt, pVopt, Uopt, Vopt, info] = gridGenerator(grid_fun, Ns, Nt, Nsteps)
-% gridGenerator (CONSISTENT / NO-UNDEFINED-VARS VERSION)
-% Softmax reclustering optimized by coordinate FD SGD (BLIND steps),
-% then solve anisotropic Laplace PDE (divergence form) for the physical grid.
+% gridGenerator (RECLUSTER LOOP VERSION - DUAL-CELL CONSISTENT)
+% Cheap robust reclustering on the reference rectangle using a Jacobian-based monitor.
+% Nsteps = number of reclustering iterations.
 %
-% OUTPUTS:
-%   C_opt, E_opt, Xopt, Yopt, Jc, pUopt, pVopt, Uopt, Vopt, info
-%
-% Notes:
-% - pU, pV are logits (log spacings up to an additive constant).
-% - Reference spacings are: dU = softmax(pU), dV = C*softmax(pV)
-% - This version does NOT do accept/reject filtering (blind SGD).
+% This version avoids padarray and uses widths consistent with the monitor layout:
+%   - if w is (J-2)x(I-2), use dual-cell widths
+%   - if w is (J-1)x(I-1), use full strip widths
+%   - if w is JxI, first average to cell values
 
-%% ---- initialize outputs (prevents "not assigned" errors) ----
+%% ---- initialize outputs ----
 C_opt = NaN; E_opt = NaN;
 Xopt = []; Yopt = []; Jc = [];
 pUopt = []; pVopt = [];
@@ -20,47 +17,40 @@ info = struct();
 
 %% ---------------- settings ----------------
 I = Ns; J = Nt;
-if nargin < 4 || isempty(Nsteps), Nsteps = 200; end
+if nargin < 4 || isempty(Nsteps)
+    Nsteps = 25;
+end
+Nsteps = floor(Nsteps);
 
-% Derivative accuracy for metrics / reference coefficients (even)
-derivOrder = 4;    % 2,4,6,...
+derivOrder = 4;
 
-% Base energy (for reporting / objective)
 thetaW = 0.2;
 mu = 1.0; lambda = 1.0;
 epsJ = 1e-6; kappa = 10.0;
 epsJw = 1e-10;
 
-% Other penalties (keep)
 gammaOrth = 1e-2;
 gammaAR   = 1e-2;
 betaAB    = 1e-6;
 
-% Sliver reporting configuration (NOT used as a filter here)
-filterMode = 'minq';    % 'minq' or 'ESJ'
+filterMode = 'minq';
 qminSJ   = 0.25;
 
-% PDE coefficient safety
 epsDen = 1e-14;
 
-% Index spacing
 hs = 1/(I-1);
 ht = 1/(J-1);
 
-% Brent for C (optional)
 useBrent = true;
 C_fixed = 0.4269;
 C_bracket = [0.01, 10];
 C_tol = 1e-6;
 
-% SGD/FD settings (BLIND steps)
-opts.maxIter = max(0, Nsteps);
-opts.batchK = 6;
-opts.fdStep = 1e-4;
-opts.lr0 = 0.08;
-opts.decay = 1e-3;
-opts.displayEvery = 25;
-opts.nU = I-1; % for gauge re-centering inside SGD
+alphaMon = 0.5;
+epsMon   = 1e-12;
+doU = true;
+doV = true;
+nSmooth = 1;
 
 %% ---------------- boundary setup ----------------
 [Xc, Yc] = grid_fun(I-1, J-1);
@@ -79,7 +69,6 @@ BND.X(J,:) = Xc(end,:);  BND.Y(J,:) = Yc(end,:);
 BND.X(:,1) = Xc(:,1);    BND.Y(:,1) = Yc(:,1);
 BND.X(:,I) = Xc(:,end);  BND.Y(:,I) = Yc(:,end);
 
-% corners
 BND.X(1,1)=Xc(1,1);         BND.Y(1,1)=Yc(1,1);
 BND.X(1,I)=Xc(1,end);       BND.Y(1,I)=Yc(1,end);
 BND.X(J,1)=Xc(end,1);       BND.Y(J,1)=Yc(end,1);
@@ -97,30 +86,72 @@ else
 end
 fprintf('C_opt = %.8f\n', C_opt);
 
-%% ---------------- Stage 2: blind SGD on z=[pU;pV] ----------------
-z0 = [pU0; pV0];
+%% ---------------- Stage 2: reclustering loop ----------------
+pU = pU0;
+pV = pV0;
 
-% energy-only objective as function of z
-fZ = @(z) objectiveScalar(C_opt, z(1:I-1), z(I:end));
+Ehist = nan(max(Nsteps,1),1);
+CVhist = nan(max(Nsteps,1),1);
+Vloghist = nan(max(Nsteps,1),1);
 
-[zopt, Ehist] = sgdCoordFD_blind(fZ, z0, opts);
+if Nsteps <= 0
+    [Uopt, Vopt] = buildReferenceGridSoftmax(C_opt, pU, pV, I, J);
+    [Xopt, Yopt] = solveAnisoLaplaceFromUV(Uopt, Vopt, BND, epsDen, hs, ht, derivOrder);
+    [xs, ys, xt, yt] = metricsHighOrder(Xopt, Yopt, hs, ht, derivOrder);
+    Jc = xs.*yt - xt.*ys;
 
-info.Ehist = Ehist;
-E_opt = Ehist(end);
+    pUopt = pU; pVopt = pV;
+    E_opt = NaN;
+    info.Ehist = [];
+    info.CVhist = [];
+    info.Vloghist = [];
+else
+    for k = 1:Nsteps
+        [U, V] = buildReferenceGridSoftmax(C_opt, pU, pV, I, J);
+        [X, Y] = solveAnisoLaplaceFromUV(U, V, BND, epsDen, hs, ht, derivOrder);
 
-% unpack final logits
-pUopt = zopt(1:I-1);
-pVopt = zopt(I:end);
+        ENH = neoHookeanEnergyHO(X, Y, hs, ht, mu, lambda, epsJ, kappa, derivOrder);
+        EW  = winslowEnergyHO(X, Y, hs, ht, derivOrder, epsJw);
+        Ebase = (1-thetaW)*ENH + thetaW*EW;
 
-%% ---------------- final solve ----------------
-[Uopt, Vopt] = buildReferenceGridSoftmax(C_opt, pUopt, pVopt, I, J);
-[Xopt, Yopt] = solveAnisoLaplaceFromUV(Uopt, Vopt, BND, epsDen, hs, ht, derivOrder);
+        Eorth = orthogonalityPenaltyHO(X, Y, hs, ht, derivOrder);
+        Ear   = aspectRatioPenaltyHO(X, Y, hs, ht, derivOrder);
+        Ereg  = betaAB*(sum(pU(:).^2)+sum(pV(:).^2));
+        Ehist(k) = Ebase + gammaOrth*Eorth + gammaAR*Ear + Ereg;
 
-% final jacobian (cell centers)
-[xs, ys, xt, yt] = metricsHighOrder(Xopt, Yopt, hs, ht, derivOrder);
-Jc = xs.*yt - xt.*ys;
+        [xs, ys, xt, yt] = metricsHighOrder(X, Y, hs, ht, derivOrder);
+        Jc_now = xs.*yt - xt.*ys;
 
-% final sliver metric (just for printing/info)
+        muJ = mean(Jc_now(:));
+        sigJ = std(Jc_now(:));
+        CVhist(k) = sigJ / max(1e-30, abs(muJ));
+        Vloghist(k) = var(log(abs(Jc_now(:)) + 1e-30));
+
+        w = (abs(Jc_now) + epsMon).^alphaMon;
+
+        [pU, pV] = reclusterSoftmaxFromMonitor(U, V, w, C_opt, doU, doV, nSmooth);
+
+        if mod(k, max(1, round(Nsteps/10))) == 0 || k == 1
+            fprintf('recluster %4d/%d: E=%.6e  CV(J)=%.3e  Var(log|J|)=%.3e\n', ...
+                k, Nsteps, Ehist(k), CVhist(k), Vloghist(k));
+        end
+    end
+
+    info.Ehist = Ehist(1:Nsteps);
+    info.CVhist = CVhist(1:Nsteps);
+    info.Vloghist = Vloghist(1:Nsteps);
+
+    E_opt = Ehist(Nsteps);
+    pUopt = pU;
+    pVopt = pV;
+
+    [Uopt, Vopt] = buildReferenceGridSoftmax(C_opt, pUopt, pVopt, I, J);
+    [Xopt, Yopt] = solveAnisoLaplaceFromUV(Uopt, Vopt, BND, epsDen, hs, ht, derivOrder);
+
+    [xs, ys, xt, yt] = metricsHighOrder(Xopt, Yopt, hs, ht, derivOrder);
+    Jc = xs.*yt - xt.*ys;
+end
+
 [minq, ESJ] = scaledJacobianStatsHO(Xopt, Yopt, hs, ht, derivOrder, qminSJ);
 if strcmpi(filterMode,'minq')
     g_opt = minq;
@@ -129,6 +160,7 @@ else
 end
 info.minq = minq;
 info.ESJ  = ESJ;
+info.g_opt = g_opt;
 
 fprintf('Final: E=%.6e, minq=%.6e, ESJ=%.6e\n', E_opt, minq, ESJ);
 
@@ -136,7 +168,7 @@ fprintf('Final: E=%.6e, minq=%.6e, ESJ=%.6e\n', E_opt, minq, ESJ);
 figure; hold on; axis equal; box on;
 for jj=1:J, plot(Xopt(jj,:), Yopt(jj,:), '-k'); end
 for ii=1:I, plot(Xopt(:,ii), Yopt(:,ii), '-k'); end
-title(sprintf('Physical grid (blind SGD), C=%.4f', C_opt));
+title(sprintf('Physical grid (recluster loop), C=%.4f', C_opt));
 xlabel('X'); ylabel('Y');
 
 figure; hold on; axis equal; box on;
@@ -148,28 +180,33 @@ xlabel('u'); ylabel('v');
 figure; imagesc(Jc); axis image; colorbar;
 title('det(dX/dsdt) at cell centers'); xlabel('i'); ylabel('j');
 
+if Nsteps > 0
+    figure; plot(1:Nsteps, info.CVhist, '-o'); grid on;
+    xlabel('recluster iter'); ylabel('CV(detJ)');
+
+    figure; plot(1:Nsteps, info.Vloghist, '-o'); grid on;
+    xlabel('recluster iter'); ylabel('Var(log|detJ|)');
+end
+
 %% ---------------- nested objective helpers ----------------
-    function E = objectiveScalar(C, pU, pV)
-        [E, ~] = objectiveWithSliver(C, pU, pV); %#ok<ASGLU>
+    function E = objectiveScalar(C, pUloc, pVloc)
+        [E, ~] = objectiveWithSliver(C, pUloc, pVloc); %#ok<ASGLU>
     end
 
-    function [E, g] = objectiveWithSliver(C, pU, pV)
-        [U, V] = buildReferenceGridSoftmax(C, pU, pV, I, J);
+    function [E, g] = objectiveWithSliver(C, pUloc, pVloc)
+        [U, V] = buildReferenceGridSoftmax(C, pUloc, pVloc, I, J);
         [X, Y] = solveAnisoLaplaceFromUV(U, V, BND, epsDen, hs, ht, derivOrder);
 
-        % base energy
         ENH = neoHookeanEnergyHO(X, Y, hs, ht, mu, lambda, epsJ, kappa, derivOrder);
         EW  = winslowEnergyHO(X, Y, hs, ht, derivOrder, epsJw);
         Ebase = (1-thetaW)*ENH + thetaW*EW;
 
-        % penalties
         Eorth = orthogonalityPenaltyHO(X, Y, hs, ht, derivOrder);
         Ear   = aspectRatioPenaltyHO(X, Y, hs, ht, derivOrder);
-        Ereg  = betaAB*(sum(pU(:).^2)+sum(pV(:).^2));
+        Ereg  = betaAB*(sum(pUloc(:).^2)+sum(pVloc(:).^2));
 
         E = Ebase + gammaOrth*Eorth + gammaAR*Ear + Ereg;
 
-        % sliver metric (reported only)
         [minq2, ESJ2] = scaledJacobianStatsHO(X, Y, hs, ht, derivOrder, qminSJ);
         if strcmpi(filterMode,'minq')
             g = minq2;
@@ -180,65 +217,155 @@ title('det(dX/dsdt) at cell centers'); xlabel('i'); ylabel('j');
 end
 
 %% =======================================================================
-%% Blind coordinate-FD SGD: returns energy history vector
-function [z, Ehist] = sgdCoordFD_blind(evalE, z0, opts)
-z = z0(:);
+function [pUnew, pVnew] = reclusterSoftmaxFromMonitor(Ugrid, Vgrid, w, C, doU, doV, nSmooth)
+% Reclustering using the monitor on the SAME layout it is computed on.
+% Supports:
+%   w size = (J-2)x(I-2)  [preferred: from metricsHighOrder Jacobian]
+%   w size = (J-1)x(I-1)
+%   w size = JxI          [node-based; converted to cells]
+%
+% No padarray, no toolbox dependencies.
 
-if opts.maxIter <= 0
-    Ehist = evalE(z);
+[J,I] = size(Ugrid);
+
+U = Ugrid(1,:).';
+V = Vgrid(:,1);
+
+du = diff(U);       % (I-1)x1
+dv = diff(V);       % (J-1)x1
+
+sw = size(w);
+
+% normalize orientation first
+if isequal(sw,[I-2,J-2]) || isequal(sw,[I-1,J-1]) || isequal(sw,[I,J])
+    w = w.';
+    sw = size(w);
+end
+
+% convert node-based monitor to cell-based if needed
+if isequal(sw,[J,I])
+    w = 0.25*(w(1:end-1,1:end-1) + w(2:end,1:end-1) + ...
+              w(1:end-1,2:end)   + w(2:end,2:end));
+    sw = size(w); % now (J-1)x(I-1)
+end
+
+% choose widths consistent with w layout
+if isequal(sw,[J-2,I-2])
+    du_eff = 0.5*(du(1:end-1) + du(2:end));   % (I-2)x1
+    dv_eff = 0.5*(dv(1:end-1) + dv(2:end));   % (J-2)x1
+elseif isequal(sw,[J-1,I-1])
+    du_eff = du;                               % (I-1)x1
+    dv_eff = dv;                               % (J-1)x1
+else
+    error('Monitor w has unsupported size %s. Expected [%d %d], [%d %d], or [%d %d].', ...
+        mat2str(sw), J-2, I-2, J-1, I-1, J, I);
+end
+
+if nSmooth > 0
+    for s = 1:nSmooth
+        w = smooth2D(w);
+    end
+end
+
+% ---------------- V recluster ----------------
+if doV
+    A = w * du_eff;          % row masses
+    Mv = A .* dv_eff;        % weighted strip mass
+
+    Stot = sum(Mv);
+    if ~isfinite(Stot) || Stot <= 0, Stot = 1; end
+
+    if isequal(sw,[J-2,I-2])
+        Vnodes = [V(1); V(2:end-1); V(end)];
+        Snodes = [0; cumsum(Mv); Stot];
+    else
+        Vnodes = V;
+        Snodes = [0; cumsum(Mv)];
+    end
+
+    Vnew = invertCumulative(Vnodes, Snodes, linspace(0, Stot, J).');
+    Vnew(1) = 0; Vnew(end) = C;
+    Vnew = enforceMonotone(Vnew);
+
+    dvNew = diff(Vnew);
+    dvNew = max(dvNew, 1e-15);
+    pVnew = log(dvNew);
+    pVnew = pVnew - mean(pVnew);
+else
+    pVnew = log(diff(V));
+    pVnew = pVnew - mean(pVnew);
+end
+
+% ---------------- U recluster ----------------
+if doU
+    B = w.' * dv_eff;        % column masses
+    Mu = B .* du_eff;
+
+    Ttot = sum(Mu);
+    if ~isfinite(Ttot) || Ttot <= 0, Ttot = 1; end
+
+    if isequal(sw,[J-2,I-2])
+        Unodes = [U(1); U(2:end-1); U(end)];
+        Tnodes = [0; cumsum(Mu); Ttot];
+    else
+        Unodes = U;
+        Tnodes = [0; cumsum(Mu)];
+    end
+
+    Unew = invertCumulative(Unodes, Tnodes, linspace(0, Ttot, I).');
+    Unew(1) = 0; Unew(end) = 1;
+    Unew = enforceMonotone(Unew);
+
+    duNew = diff(Unew);
+    duNew = max(duNew, 1e-15);
+    pUnew = log(duNew);
+    pUnew = pUnew - mean(pUnew);
+else
+    pUnew = log(diff(U));
+    pUnew = pUnew - mean(pUnew);
+end
+end
+
+function W = smooth2D(W)
+W = W(:,:);
+if min(size(W)) < 3, return; end
+W2 = W;
+W2(2:end-1,2:end-1) = 0.5*W(2:end-1,2:end-1) + ...
+    0.125*(W(1:end-2,2:end-1) + W(3:end,2:end-1) + ...
+           W(2:end-1,1:end-2) + W(2:end-1,3:end));
+W = W2;
+end
+
+function x = enforceMonotone(x)
+x = x(:);
+for k = 2:numel(x)
+    if x(k) < x(k-1)
+        x(k) = x(k-1);
+    end
+end
+end
+
+function xnew = invertCumulative(xnodes, S, Squery)
+xnodes = xnodes(:);
+S = S(:);
+Squery = Squery(:);
+
+for k = 2:numel(S)
+    if S(k) < S(k-1)
+        S(k) = S(k-1);
+    end
+end
+
+keep = [true; diff(S) > 0];
+if sum(keep) < 2
+    xnew = linspace(xnodes(1), xnodes(end), numel(Squery)).';
     return;
 end
 
-n = numel(z);
-K = min(opts.batchK, n);
-Ehist = nan(opts.maxIter,1);
-
-for it = 1:opts.maxIter
-    lr = opts.lr0 / (1 + opts.decay*it);
-
-    idxs = randperm(n, K);
-    ghat = zeros(n,1);
-
-    for kk = 1:K
-        i = idxs(kk);
-        hi = opts.fdStep * max(1, abs(z(i)));
-
-        zp = z; zm = z;
-        zp(i) = zp(i) + hi;
-        zm(i) = zm(i) - hi;
-
-        Ep = evalE(zp);
-        Em = evalE(zm);
-
-        if isfinite(Ep) && isfinite(Em)
-            ghat(i) = (Ep - Em) / (2*hi);
-        else
-            ghat(i) = 0;
-        end
-    end
-
-    % take the step blindly
-    z = z - lr*ghat;
-
-    % re-center pU and pV separately to remove softmax gauge drift
-    if isfield(opts,'nU')
-        nU = opts.nU;
-        if nU >= 1 && nU < n
-            z(1:nU) = z(1:nU) - mean(z(1:nU));
-            z(nU+1:end) = z(nU+1:end) - mean(z(nU+1:end));
-        end
-    end
-
-    Ehist(it) = evalE(z);
-
-    if isfield(opts,'displayEvery') && mod(it, opts.displayEvery)==0
-        fprintf('iter %4d: E=%.6e  lr=%.3e  K=%d\n', it, Ehist(it), lr, K);
-    end
-end
+xnew = interp1(S(keep), xnodes(keep), Squery, 'linear', 'extrap');
 end
 
 %% =======================================================================
-%% Build reference grid u,v from softmax reclustering
 function [Ugrid, Vgrid] = buildReferenceGridSoftmax(C, pU, pV, I, J)
 pU = pU(:); pV = pV(:);
 dU = softmax_safe(pU);
@@ -263,7 +390,6 @@ end
 end
 
 %% =======================================================================
-%% Scaled Jacobian stats (cell-centered): min(q) and ESJ
 function [minq, ESJ] = scaledJacobianStatsHO(X, Y, hs, ht, derivOrder, qmin)
 if nargin<6, qmin=0.25; end
 epsn = 1e-14;
@@ -278,7 +404,6 @@ ESJ = (hs*ht) * sum(r(:).^2);
 end
 
 %% =======================================================================
-%% Solve anisotropic Laplace PDE in divergence form using HIGH-ORDER ref derivatives
 function [X, Y] = solveAnisoLaplaceFromUV(Ugrid, Vgrid, BND, epsDen, hs, ht, derivOrder)
 [J,I] = size(BND.X);
 nI = I-2; nJ = J-2;
@@ -362,7 +487,6 @@ Y(2:end-1,2:end-1) = reshape(Yvec, [nI,nJ])';
 end
 
 %% =======================================================================
-%% Energies / penalties
 function ENH = neoHookeanEnergyHO(X, Y, hs, ht, mu, lambda, epsJ, kappa, derivOrder)
 cellArea = hs*ht;
 [xs, ys, xt, yt] = metricsHighOrder(X, Y, hs, ht, derivOrder);
@@ -403,7 +527,6 @@ Ear = (hs*ht) * sum(r(:).^2);
 end
 
 %% =======================================================================
-%% High-order metrics (Fornberg FD)
 function [xs, ys, xt, yt] = metricsHighOrder(X, Y, hs, ht, derivOrder)
 Xs = diff1_highorder_dim2(X, hs, derivOrder);
 Ys = diff1_highorder_dim2(Y, hs, derivOrder);
@@ -499,7 +622,6 @@ w = c(:, m+1).';
 end
 
 %% =======================================================================
-%% Brent minimizer (scalar) - your robust version
 function [xopt, fopt] = brentMin(f, ax, bx, tol)
 if nargin < 4 || isempty(tol), tol = 1e-6; end
 
