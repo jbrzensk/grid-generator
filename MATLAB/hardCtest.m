@@ -13,7 +13,7 @@ Nt = 41;        % # rows    (t-direction)
 
 % NOTE: In the modified gridGenerator, this is interpreted as:
 %   N_basis = number of SGD steps for softmax reclustering
-N_basis = 1000;  % try 100..1000
+N_basis = 10;  % try 100..1000
 
 %% --- Grid function handle ---
 grid_fun = @makeGridHardC;   % must return [X,Y] of size Nt x Ns
