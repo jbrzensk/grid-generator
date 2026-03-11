@@ -26,12 +26,12 @@ Y = R .* sin(Theta);                  % y-coordinate
 figure('Color','w'); hold on
 
 % Radial lines (eta-direction)
-for j = 1:Nj
+for j = 1:Nj+1
     plot(X(j,:), Y(j,:), 'k-', 'LineWidth', 0.8);
 end
 
 % Circular lines (xi-direction)
-for i = 1:Ni
+for i = 1:Ni+1
     plot(X(:,i), Y(:,i), 'k-', 'LineWidth', 0.8);
 end
 
