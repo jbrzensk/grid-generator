@@ -1,0 +1,475 @@
+%% test_vanillaLaplace
+% Plain Laplace baseline on a uniform computational grid.
+% Reports:
+%   E
+%   minq
+%   ESJ
+%
+% Change grid_fun below to compare against your grid generator result.
+
+clc; clear; close all;
+
+thisDir = fileparts(mfilename('fullpath'));
+addpath(thisDir);
+addpath(fullfile(thisDir,'Grids'));
+
+%% --- Parameters ---
+Ns = 21;
+Nt = 21;
+
+%% --- Grid function handle ---
+grid_fun = @makeGridChevron;   % or @makeGridC
+
+%% --- Sanity check on grid_fun output sizes ---
+[Xc, Yc] = grid_fun(Ns-1, Nt-1);
+fprintf('grid_fun returned size(Xc)=%s, size(Yc)=%s\n', mat2str(size(Xc)), mat2str(size(Yc)));
+
+if ~isequal(size(Xc), [Nt, Ns]) && isequal(size(Xc), [Ns, Nt])
+    warning('grid_fun returned (Ns x Nt). Transposing to (Nt x Ns).');
+    Xc = Xc.'; Yc = Yc.';
+end
+if ~isequal(size(Xc), [Nt, Ns])
+    warning('Expected (Nt x Ns)=(%d x %d), got %s. Proceeding anyway...', Nt, Ns, mat2str(size(Xc)));
+end
+
+%% --- Run vanilla Laplace baseline ---
+stats = vanillaLaplaceBaseline(grid_fun, Ns, Nt);
+
+%% --- Print results ---
+fprintf('\nVANILLA LAPLACE BASELINE:\n');
+fprintf('  E    = %.6e\n', stats.E);
+fprintf('  minq = %.6e\n', stats.minq);
+fprintf('  ESJ  = %.6e\n', stats.ESJ);
+fprintf('  minJ = %.6e\n', min(stats.Jc(:)));
+
+%% --- Plot grid ---
+figure; hold on; axis equal; box on;
+for j = 1:Nt
+    plot(stats.X(j,:), stats.Y(j,:), '-r');
+end
+for i = 1:Ns
+    plot(stats.X(:,i), stats.Y(:,i), '-b');
+end
+title('Vanilla Laplace grid');
+xlabel('X'); ylabel('Y');
+
+%% --- Plot Jacobian ---
+figure;
+imagesc(stats.Jc);
+axis image; colorbar;
+title('Jacobian J');
+xlabel('i'); ylabel('j');
+
+%% --- Plot folded cells in computational domain [0,1]^2 ---
+folded = foldedCellMask(stats.X, stats.Y);
+
+u = linspace(0,1,Ns);
+v = linspace(0,1,Nt);
+
+figure; hold on; axis equal; box on;
+xlim([0 1]); ylim([0 1]);
+
+for j = 1:Nt-1
+    for i = 1:Ns-1
+        px = [u(i), u(i+1), u(i+1), u(i)];
+        py = [v(j), v(j), v(j+1), v(j+1)];
+
+        if folded(j,i)
+            patch(px, py, 'r', ...
+                'FaceAlpha', 0.65, ...
+                'EdgeColor', 'k');
+        else
+            patch(px, py, 'w', ...
+                'FaceAlpha', 0.15, ...
+                'EdgeColor', [0.75 0.75 0.75]);
+        end
+    end
+end
+
+title('Computational cells in [0,1]^2 colored by folded physical cells');
+xlabel('s'); ylabel('t');
+
+fprintf('Number of folded physical cells = %d\n', nnz(folded));
+
+%% =======================================================================
+function stats = vanillaLaplaceBaseline(grid_fun, Ns, Nt)
+% vanillaLaplaceBaseline
+% Plain Laplace grid generation on a uniform computational grid.
+
+%% settings
+I = Ns;
+J = Nt;
+
+derivOrder = 2;
+hs = 1/(I-1);
+ht = 1/(J-1);
+
+% Match your energy setup as closely as possible
+thetaW = 0;         % 0 => neo-Hookean only
+mu = 1.0;
+lambda = 1.0;
+epsJ = 1e-6;
+kappa = 10.0;
+epsJw = 1e-10;
+
+gammaOrth = 4e-2;
+gammaAR   = 4e-2;
+betaAB    = 0.0;    % no reference-grid regularization here
+
+qminSJ = 0.25;
+
+%% boundary setup
+[Xc, Yc] = grid_fun(I-1, J-1);
+
+if ~isequal(size(Xc), [J I]) && isequal(size(Xc), [I J])
+    warning('grid_fun returned (Ns x Nt). Transposing to (Nt x Ns).');
+    Xc = Xc.'; Yc = Yc.';
+end
+if ~isequal(size(Xc), [J I])
+    error('grid_fun must return size (Nt x Ns) = (%d x %d). Got %s.', J, I, mat2str(size(Xc)));
+end
+
+BND.X = nan(J,I); BND.Y = nan(J,I);
+BND.X(1,:) = Xc(1,:);    BND.Y(1,:) = Yc(1,:);
+BND.X(J,:) = Xc(end,:);  BND.Y(J,:) = Yc(end,:);
+BND.X(:,1) = Xc(:,1);    BND.Y(:,1) = Yc(:,1);
+BND.X(:,I) = Xc(:,end);  BND.Y(:,I) = Yc(:,end);
+
+BND.X(1,1)=Xc(1,1);         BND.Y(1,1)=Yc(1,1);
+BND.X(1,I)=Xc(1,end);       BND.Y(1,I)=Yc(1,end);
+BND.X(J,1)=Xc(end,1);       BND.Y(J,1)=Yc(end,1);
+BND.X(J,I)=Xc(end,end);     BND.Y(J,I)=Yc(end,end);
+
+%% uniform computational/reference grid
+u = linspace(0,1,I);
+v = linspace(0,1,J);
+
+U = repmat(u, J, 1);
+V = repmat(v(:), 1, I);
+
+%% solve plain Laplace
+[X, Y, Jc] = solveVanillaLaplace(BND, hs, ht);
+
+%% energies / quality stats
+ENH = neoHookeanEnergyHO(X, Y, hs, ht, mu, lambda, epsJ, kappa, derivOrder);
+EW  = winslowEnergyHO(X, Y, hs, ht, derivOrder, epsJw);
+Ebase = (1-thetaW)*ENH + thetaW*EW;
+
+Eorth = orthogonalityPenaltyHO(X, Y, hs, ht, derivOrder);
+Ear   = aspectRatioPenaltyHO(X, Y, hs, ht, derivOrder);
+Ereg  = betaAB * 0.0;
+
+E = Ebase + gammaOrth*Eorth + gammaAR*Ear + Ereg;
+
+[minq, ESJ] = scaledJacobianStatsHO(X, Y, hs, ht, derivOrder, qminSJ);
+
+%% pack
+stats = struct();
+stats.E    = E;
+stats.minq = minq;
+stats.ESJ  = ESJ;
+
+stats.X = X;
+stats.Y = Y;
+stats.Jc = Jc;
+stats.U = U;
+stats.V = V;
+
+stats.ENH   = ENH;
+stats.EW    = EW;
+stats.Eorth = Eorth;
+stats.Ear   = Ear;
+end
+
+%% =======================================================================
+function [X, Y, Jc] = solveVanillaLaplace(BND, hs, ht)
+% Plain Laplace solve:
+%   X_ss + X_tt = 0
+%   Y_ss + Y_tt = 0
+
+[J, I] = size(BND.X);
+nI = I - 2;
+nJ = J - 2;
+N  = nI * nJ;
+
+idx = @(ii,jj) (jj-1)*nI + ii;
+
+ii = zeros(5*N,1);
+jj = zeros(5*N,1);
+ss = zeros(5*N,1);
+bX = zeros(N,1);
+bY = zeros(N,1);
+ptr = 0;
+
+ax = 1 / hs^2;
+at = 1 / ht^2;
+
+for jj_int = 1:nJ
+    jg = jj_int + 1;
+    for ii_int = 1:nI
+        ig  = ii_int + 1;
+        row = idx(ii_int, jj_int);
+
+        Ww = ax;
+        We = ax;
+        Ws = at;
+        Wn = at;
+
+        diagv = Ww + We + Ws + Wn;
+
+        ptr = ptr + 1; ii(ptr) = row; jj(ptr) = row; ss(ptr) = diagv;
+
+        if ii_int > 1
+            ptr = ptr + 1; ii(ptr) = row; jj(ptr) = idx(ii_int-1, jj_int); ss(ptr) = -Ww;
+        else
+            bX(row) = bX(row) + Ww * BND.X(jg,1);
+            bY(row) = bY(row) + Ww * BND.Y(jg,1);
+        end
+
+        if ii_int < nI
+            ptr = ptr + 1; ii(ptr) = row; jj(ptr) = idx(ii_int+1, jj_int); ss(ptr) = -We;
+        else
+            bX(row) = bX(row) + We * BND.X(jg,I);
+            bY(row) = bY(row) + We * BND.Y(jg,I);
+        end
+
+        if jj_int > 1
+            ptr = ptr + 1; ii(ptr) = row; jj(ptr) = idx(ii_int, jj_int-1); ss(ptr) = -Ws;
+        else
+            bX(row) = bX(row) + Ws * BND.X(1,ig);
+            bY(row) = bY(row) + Ws * BND.Y(1,ig);
+        end
+
+        if jj_int < nJ
+            ptr = ptr + 1; ii(ptr) = row; jj(ptr) = idx(ii_int, jj_int+1); ss(ptr) = -Wn;
+        else
+            bX(row) = bX(row) + Wn * BND.X(J,ig);
+            bY(row) = bY(row) + Wn * BND.Y(J,ig);
+        end
+    end
+end
+
+A = sparse(ii(1:ptr), jj(1:ptr), ss(1:ptr), N, N);
+
+Xvec = A \ bX;
+Yvec = A \ bY;
+
+X = BND.X;
+Y = BND.Y;
+X(2:end-1,2:end-1) = reshape(Xvec, [nI, nJ]).';
+Y(2:end-1,2:end-1) = reshape(Yvec, [nI, nJ]).';
+
+derivOrder = 2;
+[xs, ys, xt, yt] = metricsHighOrder(X, Y, hs, ht, derivOrder);
+Jc = xs.*yt - xt.*ys;
+end
+
+%% =======================================================================
+function folded = foldedCellMask(X, Y)
+% folded(j,i)=true if physical cell (j,i) is folded/inverted.
+% The returned mask has size (Nt-1) x (Ns-1).
+%
+% A quad is marked folded if:
+%   1. Its signed polygon area is non-positive, or
+%   2. Its corner orientations are mixed, indicating a bow-tie/self-crossed cell.
+
+[J,I] = size(X);
+folded = false(J-1,I-1);
+
+tol = 1e-14;
+
+for j = 1:J-1
+    for i = 1:I-1
+        px = [X(j,i), X(j,i+1), X(j+1,i+1), X(j+1,i)];
+        py = [Y(j,i), Y(j,i+1), Y(j+1,i+1), Y(j+1,i)];
+
+        % Signed polygon area
+        A = 0.5 * sum(px .* py([2 3 4 1]) - py .* px([2 3 4 1]));
+
+        % Edge vectors around the quadrilateral
+        e1 = [px(2)-px(1), py(2)-py(1)];
+        e2 = [px(3)-px(2), py(3)-py(2)];
+        e3 = [px(4)-px(3), py(4)-py(3)];
+        e4 = [px(1)-px(4), py(1)-py(4)];
+
+        % Signed turns at corners
+        c = zeros(4,1);
+        c(1) = cross2(e1,e2);
+        c(2) = cross2(e2,e3);
+        c(3) = cross2(e3,e4);
+        c(4) = cross2(e4,e1);
+
+        hasMixedOrientation = any(c > tol) && any(c < -tol);
+        hasNonPositiveArea  = A <= tol;
+
+        folded(j,i) = hasMixedOrientation || hasNonPositiveArea;
+    end
+end
+end
+
+function z = cross2(a,b)
+z = a(1)*b(2) - a(2)*b(1);
+end
+
+%% =======================================================================
+function [minq, ESJ] = scaledJacobianStatsHO(X, Y, hs, ht, derivOrder, qmin)
+if nargin < 6, qmin = 0.25; end
+epsn = 1e-14;
+[xs, ys, xt, yt] = metricsHighOrder(X, Y, hs, ht, derivOrder);
+Jc = xs.*yt - xt.*ys;
+na = sqrt(xs.^2 + ys.^2 + epsn);
+nb = sqrt(xt.^2 + yt.^2 + epsn);
+q = Jc ./ (na.*nb + epsn);
+minq = min(q(:));
+r = max(0, qmin - q);
+ESJ = (hs*ht) * sum(r(:).^2);
+end
+
+%% =======================================================================
+function ENH = neoHookeanEnergyHO(X, Y, hs, ht, mu, lambda, epsJ, kappa, derivOrder)
+cellArea = hs*ht;
+[xs, ys, xt, yt] = metricsHighOrder(X, Y, hs, ht, derivOrder);
+Jc = xs.*yt - xt.*ys;
+Jsafe = max(Jc, epsJ);
+logJ  = log(Jsafe);
+d = 2;
+trC = xs.^2 + ys.^2 + xt.^2 + yt.^2;
+W = 0.5*mu*(trC - d) - mu*logJ + 0.5*lambda*(logJ.^2);
+r = max(0, epsJ - Jc);
+B = kappa*(r.^2);
+ENH = cellArea * sum(W(:) + B(:));
+end
+
+function EW = winslowEnergyHO(X, Y, hs, ht, derivOrder, epsJw)
+[xs, ys, xt, yt] = metricsHighOrder(X, Y, hs, ht, derivOrder);
+a2 = xs.^2 + ys.^2;
+b2 = xt.^2 + yt.^2;
+Jc = xs.*yt - ys.*xt;
+Jsafe = max(Jc, epsJw);
+tmp = (a2 + b2) ./ Jsafe;
+EW = (hs*ht) * sum(tmp(:));
+end
+
+function Eorth = orthogonalityPenaltyHO(X, Y, hs, ht, derivOrder)
+[xs, ys, xt, yt] = metricsHighOrder(X, Y, hs, ht, derivOrder);
+orth = xs.*xt + ys.*yt;
+Eorth = (hs*ht) * sum(orth(:).^2);
+end
+
+function Ear = aspectRatioPenaltyHO(X, Y, hs, ht, derivOrder)
+[xs, ys, xt, yt] = metricsHighOrder(X, Y, hs, ht, derivOrder);
+a = xs.^2 + ys.^2;
+b = xt.^2 + yt.^2;
+epsr = 1e-12;
+r = log((a + epsr)./(b + epsr));
+Ear = (hs*ht) * sum(r(:).^2);
+end
+
+%% =======================================================================
+function [xs, ys, xt, yt] = metricsHighOrder(X, Y, hs, ht, derivOrder)
+Xs = diff1_highorder_dim2(X, hs, derivOrder);
+Ys = diff1_highorder_dim2(Y, hs, derivOrder);
+Xt = diff1_highorder_dim1(X, ht, derivOrder);
+Yt = diff1_highorder_dim1(Y, ht, derivOrder);
+
+xs = Xs(2:end-1,2:end-1);
+ys = Ys(2:end-1,2:end-1);
+xt = Xt(2:end-1,2:end-1);
+yt = Yt(2:end-1,2:end-1);
+end
+
+function Df = diff1_highorder_dim2(F, h, p)
+if mod(p,2) ~= 0 || p < 2
+    error('derivOrder must be even >=2');
+end
+
+[J, I] = size(F);
+r = p/2;
+m = 2*r + 1;
+Df = zeros(J, I);
+
+x = (-r:r);
+wc = fdweights(0, x, 1);
+
+for i = (r+1):(I-r)
+    Df(:,i) = (F(:, i-r:i+r) * wc(:)) / h;
+end
+
+for i = 1:r
+    xL = (0:m-1) - (i-1);
+    wL = fdweights(0, xL, 1);
+    Df(:,i) = (F(:, 1:m) * wL(:)) / h;
+end
+
+for i = (I-r+1):I
+    xR = (-(m-1):0) - (i-I);
+    wR = fdweights(0, xR, 1);
+    Df(:,i) = (F(:, I-m+1:I) * wR(:)) / h;
+end
+end
+
+function Df = diff1_highorder_dim1(F, h, p)
+if mod(p,2) ~= 0 || p < 2
+    error('derivOrder must be even >=2');
+end
+
+[J, I] = size(F);
+r = p/2;
+m = 2*r + 1;
+Df = zeros(J, I);
+
+x = (-r:r);
+wc = fdweights(0, x, 1);
+
+for j = (r+1):(J-r)
+    Df(j,:) = (wc(:).' * F(j-r:j+r, :)) / h;
+end
+
+for j = 1:r
+    xB = (0:m-1) - (j-1);
+    wB = fdweights(0, xB, 1);
+    Df(j,:) = (wB(:).' * F(1:m, :)) / h;
+end
+
+for j = (J-r+1):J
+    xT = (-(m-1):0) - (j-J);
+    wT = fdweights(0, xT, 1);
+    Df(j,:) = (wT(:).' * F(J-m+1:J, :)) / h;
+end
+end
+
+function w = fdweights(x0, x, m)
+n = numel(x);
+c = zeros(n, m+1);
+c1 = 1;
+c4 = x(1) - x0;
+c(1,1) = 1;
+
+for i = 2:n
+    mn = min(i, m+1);
+    c2 = 1;
+    c5 = c4;
+    c4 = x(i) - x0;
+
+    for j = 1:i-1
+        c3 = x(i) - x(j);
+        c2 = c2 * c3;
+
+        if j == i-1
+            for k = mn:-1:2
+                c(i,k) = (c1*((k-1)*c(i-1,k-1) - c5*c(i-1,k))) / c2;
+            end
+            c(i,1) = (-c1*c5*c(i-1,1)) / c2;
+        end
+
+        for k = mn:-1:2
+            c(j,k) = ((c4*c(j,k)) - (k-1)*c(j,k-1)) / c3;
+        end
+        c(j,1) = (c4*c(j,1)) / c3;
+    end
+
+    c1 = c2;
+end
+
+w = c(:, m+1).';
+end

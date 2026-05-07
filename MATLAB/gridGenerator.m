@@ -27,16 +27,16 @@ if nargin < 4 || isempty(Nsteps)
 end
 Nsteps = max(0, floor(Nsteps));
 
-derivOrder = 4;
+derivOrder = 2;
 
-thetaW = 0.2;
+thetaW = 0;
 mu = 1.0; lambda = 1.0;
 epsJ = 1e-6; kappa = 10.0;
 epsJw = 1e-10;
 
-gammaOrth = 1e-2;
-gammaAR   = 1e-2;
-betaAB    = 1e-6;
+gammaOrth = 4e-2;
+gammaAR   = 4e-2;
+betaAB    = 1e-4;
 
 filterMode = 'minq';
 qminSJ = 0.25;

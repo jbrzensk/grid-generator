@@ -6,12 +6,12 @@ addpath(thisDir);
 addpath(fullfile(thisDir,'Grids'));
 
 %% --- Parameters ---
-Ns = 41;
-Nt = 41;
-N_outer = 010;   % number of ACCEPTED SGD steps (with filter)
+Ns = 21;
+Nt = 21;
+N_outer = 0010;   % number of ACCEPTED SGD steps (with filter)
 
 %% --- Grid function handle ---
-grid_fun = @makeGridC;   % <-- change to @makeGridC if you really want the C-grid
+grid_fun = @makeGridChevron;   % <-- change to @makeGridC if you really want the C-grid
 
 %% --- Sanity check on grid_fun output sizes ---
 [Xc, Yc] = grid_fun(Ns-1, Nt-1);
