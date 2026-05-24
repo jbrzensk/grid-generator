@@ -36,7 +36,7 @@ Ns = 41;          % grid points in xi direction
 Nt = 41;          % grid points in eta direction
 
 Tfinal = 1;
-CFL = 0.20;
+CFL = 0.1n w0;
 plotEvery = 25;
 
 % Soft C parameters
