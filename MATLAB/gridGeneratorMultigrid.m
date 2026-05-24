@@ -70,12 +70,12 @@ ht = 1/(J-1);
 
 % PDE anisotropy optimization.
 useACSearch = true;
-A_fixed = 1.0;
-C_fixed = 1.0;
+A_fixed = 1.5006;
+C_fixed = 0.1035;
 A_bracket = [0.05, 20];
 C_bracket = [0.05, 20];
-nAcoarse = 13;
-nCcoarse = 13;
+nAcoarse = 20;
+nCcoarse = 20;
 AC_fmin_tol = 1e-5;
 
 % Reference-grid height. Keep this separate from the PDE coefficient C.

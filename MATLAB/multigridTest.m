@@ -6,12 +6,12 @@ addpath(thisDir);
 addpath(fullfile(thisDir,'Grids'));
 
 %% --- Parameters ---
-Ns = 41;
-Nt = 21;
+Ns = 81;
+Nt = 81;
 N_outer = 0000;   % number of SGD/equalization steps
 
 %% --- Grid function handle ---
-grid_fun = @makeGridFish;  % change to @makeGridC if desired
+grid_fun = @makeGridA;  % change to @makeGridC if desired
 
 %% --- Sanity check on grid_fun output sizes ---
 [Xc, Yc] = grid_fun(Ns-1, Nt-1);

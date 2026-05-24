@@ -29,7 +29,7 @@ Nsteps = max(0, floor(Nsteps));
 
 derivOrder = 2;
 
-thetaW = 0;
+thetaW = 1;
 mu = 1.0; lambda = 1.0;
 epsJ = 1e-6; kappa = 10.0;
 epsJw = 1e-10;
