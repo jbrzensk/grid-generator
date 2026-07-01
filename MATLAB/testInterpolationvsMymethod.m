@@ -73,12 +73,12 @@ fprintf('Function check complete.\n\n');
 
 Ns = 41;
 Nt = 41;
-N_outer = 0010;   % number of ACCEPTED SGD steps with filter
+N_outer = 0000;   % number of ACCEPTED SGD steps with filter
 
 %% ------------------------------------------------------------------------
 % Grid function handle
 
-grid_fun = @makeGridC;   % change to @makeGridC if desired
+grid_fun = @makeGridSwan;   % change to @makeGridC if desired
 
 %% ------------------------------------------------------------------------
 % Sanity check on grid_fun output sizes
