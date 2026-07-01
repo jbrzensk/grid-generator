@@ -1,0 +1,2 @@
+InputGrid,Grid,L2_TFI_over_L2_GEN,Linf_TFI_over_Linf_GEN,Conclusion
+Fish,11 x 11,NaN,27717086783.3989,multigrid gridGenerator has lower Linf by 2.77e+10x

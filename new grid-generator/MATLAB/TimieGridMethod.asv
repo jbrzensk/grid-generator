@@ -1,0 +1,879 @@
+%% time_softC_hardC_swan_grid_generation_methods.m
+% Standalone timing script for comparing grid generation methods on:
+%
+%   1. Soft C
+%   2. Hard C
+%   3. Swan
+%
+% Timed methods:
+%
+%   1. Input grid_fun call
+%   2. Transfinite interpolation only
+%   3. Transfinite total = input grid_fun call + boundary extraction + TFI
+%   4. gridGenerator total = full gridGenerator(grid_fun, Ns, Nt, Nsteps)
+%
+% This script does NOT run the MOLE heat solve.
+% This script does NOT do folded-grid checks.
+%
+% Put this file in mole3/grid-generator/MATLAB and run:
+%
+%   time_softC_hardC_swan_grid_generation_methods
+%
+% The grid functions are included at the bottom of this file as no-plot
+% versions of Soft C, Hard C, and Swan so timing is not dominated by figure
+% creation from the grid input scripts.
+
+clc; clear; close all;
+
+%% ------------------------------------------------------------------------
+% Path setup
+
+thisDir = fileparts(mfilename('fullpath'));
+if isempty(thisDir)
+    thisDir = pwd;
+end
+
+addpath(thisDir);
+addpath(fullfile(thisDir, 'Grids'));
+
+% Common project / MOLE layouts.  Nonexistent folders are harmless on path.
+addpath(fullfile(thisDir, 'src', 'matlab_octave'));
+addpath(fullfile(thisDir, '..', 'src', 'matlab_octave'));
+addpath(fullfile(thisDir, '..', '..', 'src', 'matlab_octave'));
+addpath('../../src/matlab_octave');
+
+rehash toolboxcache;
+
+%% ------------------------------------------------------------------------
+% Parameters you are most likely to edit
+
+% One [Ns Nt] row per timing run.
+% The first option matches your test_softC style: Ns = 41, Nt = 21.
+gridSizes = [41 21];
+
+% Uncomment one of these for scaling runs.
+ gridSizes = [21 21; 41 41; 81 81; 41 21];
+% gridSizes = [41 21; 81 41; 121 61];
+
+% gridGenerator reclustering iterations / accepted SGD target.
+Nsteps = 10;
+
+% Timing repetitions. Increase nTrials for smoother medians.
+nWarmup = 1;
+nTrials = 5;
+
+% Suppress figures created by gridGenerator during timing.
+% The local grid functions below do not plot, but gridGenerator itself does.
+suppressFigures = true;
+
+% Suppress the console text printed by gridGenerator during timed trials.
+% This usually gives cleaner timing data than printing every iteration.
+suppressConsole = true;
+
+% Save timing tables.
+saveResults = true;
+outputDir = pwd;
+outputPrefix = 'timing_softC_hardC_swan_grid_generation_methods';
+
+% Make quick median-time comparison plots.
+plotTimingSummary = true;
+
+%% ------------------------------------------------------------------------
+% Grid cases
+
+GridCases = struct([]);
+
+GridCases(1).name = 'Soft C';
+GridCases(1).grid_fun = @makeSoftCGridNoPlot;
+
+GridCases(2).name = 'Hard C';
+GridCases(2).grid_fun = @makeHardCGridNoPlot;
+
+GridCases(3).name = 'Swan';
+GridCases(3).grid_fun = @makeSwanGridNoPlot;
+
+%% ------------------------------------------------------------------------
+% Check required functions
+
+if isempty(which('gridGenerator'))
+    error(['Cannot find gridGenerator.m. Put this timing script in mole3/grid-generator/MATLAB ', ...
+           'or add gridGenerator.m to the MATLAB path.\nDiagnostic: run "which gridGenerator -all".']);
+end
+
+gridSizes = normalizeGridSizes(gridSizes);
+
+fprintf('Using gridGenerator:\n  %s\n\n', which('gridGenerator'));
+fprintf('Timing grid cases:\n');
+for gg = 1:numel(GridCases)
+    fprintf('  %d. %s  (%s)\n', gg, GridCases(gg).name, func2str(GridCases(gg).grid_fun));
+end
+fprintf('\n');
+
+%% ------------------------------------------------------------------------
+% Warmup runs
+% These are not recorded. They reduce first-call overhead from path loading,
+% function parsing, JIT compilation, and first figure creation.
+
+for gg = 1:numel(GridCases)
+    gridName = GridCases(gg).name;
+    grid_fun = GridCases(gg).grid_fun;
+
+    for rr = 1:size(gridSizes, 1)
+        Ns = gridSizes(rr, 1);
+        Nt = gridSizes(rr, 2);
+
+        for ww = 1:nWarmup
+            try
+                [Xc, Yc] = callGridFunction(grid_fun, Ns-1, Nt-1, suppressFigures);
+                [Xc, Yc] = normalizeGridOrientation(Xc, Yc, Nt, Ns, [gridName ' input grid function']);
+                BND = buildBoundaryFromGrid(Xc, Yc);
+                [~, ~] = transfiniteInterpolationGrid(BND);
+                runGridGeneratorSilently(grid_fun, Ns, Nt, Nsteps, suppressFigures, suppressConsole);
+            catch ME
+                warning('GridTiming:WarmupFailed', 'Warmup failed for %s, %d x %d: %s', gridName, Ns, Nt, ME.message);
+            end
+        end
+    end
+end
+
+%% ------------------------------------------------------------------------
+% Measured timing runs
+
+rawRows = {};
+
+for gg = 1:numel(GridCases)
+
+    gridName = GridCases(gg).name;
+    grid_fun = GridCases(gg).grid_fun;
+
+    for rr = 1:size(gridSizes, 1)
+
+        Ns = gridSizes(rr, 1);
+        Nt = gridSizes(rr, 2);
+        gridSizeText = sprintf('%d x %d', Ns, Nt);
+
+        fprintf('\n============================================================\n');
+        fprintf('TIMING %s GRID, SIZE %s\n', gridName, gridSizeText);
+        fprintf('============================================================\n');
+
+        for trial = 1:nTrials
+
+            fprintf('\nTrial %d / %d\n', trial, nTrials);
+
+            %% -----------------------------------------------------------
+            % 1) Time input grid_fun call.
+
+            inputSec = NaN;
+            tfiOnlySec = NaN;
+            tfiTotalSec = NaN;
+            Xc = [];
+            Yc = [];
+
+            tStart = tic;
+            try
+                [Xc, Yc] = callGridFunction(grid_fun, Ns-1, Nt-1, suppressFigures);
+                [Xc, Yc] = normalizeGridOrientation(Xc, Yc, Nt, Ns, [gridName ' input grid function']);
+                inputSec = toc(tStart);
+                inputStatus = 'ok';
+                inputMsg = '';
+            catch ME
+                inputSec = toc(tStart);
+                inputStatus = 'failed';
+                inputMsg = ME.message;
+            end
+
+            rawRows(end+1,:) = makeTimingRow(gridName, gridSizeText, Ns, Nt, Nsteps, trial, ...
+                'Input grid_fun call', inputSec, inputStatus, inputMsg); %#ok<SAGROW>
+
+            fprintf('  Input grid_fun call          %.6f s  [%s]\n', inputSec, inputStatus);
+
+            %% -----------------------------------------------------------
+            % 2) Time TFI only, using the boundary of the input grid just
+            % created above.
+
+            if strcmp(inputStatus, 'ok')
+                tStart = tic;
+                try
+                    BND = buildBoundaryFromGrid(Xc, Yc);
+                    [Xtfi, Ytfi] = transfiniteInterpolationGrid(BND); %#ok<NASGU>
+                    tfiOnlySec = toc(tStart);
+                    tfiStatus = 'ok';
+                    tfiMsg = '';
+                catch ME
+                    tfiOnlySec = toc(tStart);
+                    tfiStatus = 'failed';
+                    tfiMsg = ME.message;
+                end
+
+                if strcmp(tfiStatus, 'ok')
+                    tfiTotalSec = inputSec + tfiOnlySec;
+                else
+                    tfiTotalSec = NaN;
+                end
+            else
+                tfiStatus = 'failed';
+                tfiMsg = ['input grid_fun failed: ' inputMsg];
+            end
+
+            rawRows(end+1,:) = makeTimingRow(gridName, gridSizeText, Ns, Nt, Nsteps, trial, ...
+                'Transfinite interpolation only', tfiOnlySec, tfiStatus, tfiMsg); %#ok<SAGROW>
+
+            rawRows(end+1,:) = makeTimingRow(gridName, gridSizeText, Ns, Nt, Nsteps, trial, ...
+                'Transfinite total', tfiTotalSec, tfiStatus, tfiMsg); %#ok<SAGROW>
+
+            fprintf('  TFI only                     %.6f s  [%s]\n', tfiOnlySec, tfiStatus);
+            fprintf('  TFI total                    %.6f s  [%s]\n', tfiTotalSec, tfiStatus);
+
+            %% -----------------------------------------------------------
+            % 3) Time gridGenerator. This is the complete gridGenerator
+            % call, using the same grid_fun handle.
+
+            tStart = tic;
+            try
+                [C_opt, E_grid, Xgen, Ygen, Jc, gridInfo] = ...
+                    runGridGeneratorSilently(grid_fun, Ns, Nt, Nsteps, suppressFigures, suppressConsole); %#ok<ASGLU>
+                [Xgen, Ygen] = normalizeGridOrientation(Xgen, Ygen, Nt, Ns, [gridName ' gridGenerator']); %#ok<ASGLU>
+                gridGenSec = toc(tStart);
+                gridGenStatus = 'ok';
+                gridGenMsg = '';
+            catch ME
+                gridGenSec = toc(tStart);
+                gridGenStatus = 'failed';
+                gridGenMsg = ME.message;
+            end
+
+            rawRows(end+1,:) = makeTimingRow(gridName, gridSizeText, Ns, Nt, Nsteps, trial, ...
+                'gridGenerator total', gridGenSec, gridGenStatus, gridGenMsg); %#ok<SAGROW>
+
+            fprintf('  gridGenerator total          %.6f s  [%s]\n', gridGenSec, gridGenStatus);
+
+        end
+    end
+end
+
+%% ------------------------------------------------------------------------
+% Build timing tables
+
+RawTimingTable = cell2table(rawRows, ...
+    'VariableNames', {'InputGrid','Grid','Ns','Nt','Nsteps','Trial','Method','Seconds','Status','Message'});
+
+SummaryTimingTable = summarizeTimingRows(RawTimingTable, GridCases, gridSizes);
+RatioTimingTable = makeRatioTimingTable(SummaryTimingTable, GridCases, gridSizes);
+
+fprintf('\n\n============================================================\n');
+fprintf('GRID GENERATION TIMING SUMMARY\n');
+fprintf('============================================================\n');
+
+fprintf('\n%-10s %-10s %-32s %8s %8s %14s %14s %14s %14s\n', ...
+    'InputGrid', 'Grid', 'Method', 'OK', 'Trials', 'Mean_s', 'Median_s', 'Min_s', 'Max_s');
+fprintf('%s\n', repmat('-', 1, 124));
+
+for r = 1:height(SummaryTimingTable)
+    fprintf('%-10s %-10s %-32s %8d %8d %14.6e %14.6e %14.6e %14.6e\n', ...
+        SummaryTimingTable.InputGrid{r}, ...
+        SummaryTimingTable.Grid{r}, ...
+        SummaryTimingTable.Method{r}, ...
+        SummaryTimingTable.Nok(r), ...
+        SummaryTimingTable.Ntrials(r), ...
+        SummaryTimingTable.MeanSeconds(r), ...
+        SummaryTimingTable.MedianSeconds(r), ...
+        SummaryTimingTable.MinSeconds(r), ...
+        SummaryTimingTable.MaxSeconds(r));
+end
+
+fprintf('\n\n============================================================\n');
+fprintf('MEDIAN TIME RATIOS\n');
+fprintf('============================================================\n');
+fprintf('\n%-10s %-10s %20s %20s %22s\n', ...
+    'InputGrid', 'Grid', 'TFI_total_s', 'gridGen_total_s', 'gridGen_over_TFI');
+fprintf('%s\n', repmat('-', 1, 92));
+
+for r = 1:height(RatioTimingTable)
+    fprintf('%-10s %-10s %20.6e %20.6e %22.6e\n', ...
+        RatioTimingTable.InputGrid{r}, ...
+        RatioTimingTable.Grid{r}, ...
+        RatioTimingTable.TFITotalMedianSeconds(r), ...
+        RatioTimingTable.GridGeneratorMedianSeconds(r), ...
+        RatioTimingTable.GridGeneratorOverTFI(r));
+end
+
+disp(RawTimingTable);
+disp(SummaryTimingTable);
+disp(RatioTimingTable);
+
+%% ------------------------------------------------------------------------
+% Optional plot
+
+if plotTimingSummary
+    plotTimingComparisonBars(SummaryTimingTable, GridCases, gridSizes);
+end
+
+%% ------------------------------------------------------------------------
+% Save files
+
+if saveResults
+    if ~exist(outputDir, 'dir')
+        mkdir(outputDir);
+    end
+
+    rawCsvFile = fullfile(outputDir, [outputPrefix '_raw.csv']);
+    summaryCsvFile = fullfile(outputDir, [outputPrefix '_summary.csv']);
+    ratioCsvFile = fullfile(outputDir, [outputPrefix '_ratios.csv']);
+
+    rawXlsxFile = fullfile(outputDir, [outputPrefix '_raw.xlsx']);
+    summaryXlsxFile = fullfile(outputDir, [outputPrefix '_summary.xlsx']);
+    ratioXlsxFile = fullfile(outputDir, [outputPrefix '_ratios.xlsx']);
+
+    matFile = fullfile(outputDir, [outputPrefix '.mat']);
+
+    writetable(RawTimingTable, rawCsvFile);
+    writetable(SummaryTimingTable, summaryCsvFile);
+    writetable(RatioTimingTable, ratioCsvFile);
+
+    try
+        writetable(RawTimingTable, rawXlsxFile);
+        writetable(SummaryTimingTable, summaryXlsxFile);
+        writetable(RatioTimingTable, ratioXlsxFile);
+        wroteXlsx = true;
+    catch ME
+        warning('GridTiming:WriteXlsxFailed', 'Could not write xlsx files: %s', ME.message);
+        wroteXlsx = false;
+    end
+
+    save(matFile, 'RawTimingTable', 'SummaryTimingTable', 'RatioTimingTable', ...
+        'GridCases', 'gridSizes', 'Nsteps', 'nWarmup', 'nTrials', ...
+        'suppressFigures', 'suppressConsole');
+
+    fprintf('\nSaved timing results to:\n');
+    fprintf('  %s\n', rawCsvFile);
+    fprintf('  %s\n', summaryCsvFile);
+    fprintf('  %s\n', ratioCsvFile);
+    if wroteXlsx
+        fprintf('  %s\n', rawXlsxFile);
+        fprintf('  %s\n', summaryXlsxFile);
+        fprintf('  %s\n', ratioXlsxFile);
+    end
+    fprintf('  %s\n', matFile);
+end
+
+%% ========================================================================
+function row = makeTimingRow(inputGridName, gridSizeText, Ns, Nt, Nsteps, trial, methodName, seconds, statusText, messageText)
+
+row = {char(inputGridName), char(gridSizeText), Ns, Nt, Nsteps, trial, char(methodName), ...
+       seconds, char(statusText), char(messageText)};
+
+end
+
+%% ========================================================================
+function SummaryTimingTable = summarizeTimingRows(RawTimingTable, GridCases, gridSizes)
+
+methodNames = { ...
+    'Input grid_fun call', ...
+    'Transfinite interpolation only', ...
+    'Transfinite total', ...
+    'gridGenerator total'};
+
+summaryRows = {};
+
+for gg = 1:numel(GridCases)
+    gridName = GridCases(gg).name;
+
+    for rr = 1:size(gridSizes, 1)
+        Ns = gridSizes(rr, 1);
+        Nt = gridSizes(rr, 2);
+        gridSizeText = sprintf('%d x %d', Ns, Nt);
+
+        for mm = 1:numel(methodNames)
+            methodName = methodNames{mm};
+
+            idxAll = strcmp(RawTimingTable.InputGrid, gridName) & ...
+                     strcmp(RawTimingTable.Grid, gridSizeText) & ...
+                     strcmp(RawTimingTable.Method, methodName);
+
+            idxOk = idxAll & strcmp(RawTimingTable.Status, 'ok') & isfinite(RawTimingTable.Seconds);
+
+            seconds = RawTimingTable.Seconds(idxOk);
+            nOk = numel(seconds);
+            nTrials = sum(idxAll);
+            nFailed = nTrials - nOk;
+
+            if nOk > 0
+                meanSec = mean(seconds);
+                medianSec = median(seconds);
+                stdSec = std(seconds);
+                minSec = min(seconds);
+                maxSec = max(seconds);
+            else
+                meanSec = NaN;
+                medianSec = NaN;
+                stdSec = NaN;
+                minSec = NaN;
+                maxSec = NaN;
+            end
+
+            summaryRows(end+1,:) = {char(gridName), gridSizeText, Ns, Nt, methodName, ...
+                nOk, nTrials, nFailed, meanSec, medianSec, stdSec, minSec, maxSec}; %#ok<AGROW>
+        end
+    end
+end
+
+SummaryTimingTable = cell2table(summaryRows, ...
+    'VariableNames', {'InputGrid','Grid','Ns','Nt','Method','Nok','Ntrials','Nfailed', ...
+                      'MeanSeconds','MedianSeconds','StdSeconds','MinSeconds','MaxSeconds'});
+
+end
+
+%% ========================================================================
+function RatioTimingTable = makeRatioTimingTable(SummaryTimingTable, GridCases, gridSizes)
+
+ratioRows = {};
+
+for gg = 1:numel(GridCases)
+    gridName = GridCases(gg).name;
+
+    for rr = 1:size(gridSizes, 1)
+        Ns = gridSizes(rr, 1);
+        Nt = gridSizes(rr, 2);
+        gridSizeText = sprintf('%d x %d', Ns, Nt);
+
+        idxTFI = strcmp(SummaryTimingTable.InputGrid, gridName) & ...
+                 strcmp(SummaryTimingTable.Grid, gridSizeText) & ...
+                 strcmp(SummaryTimingTable.Method, 'Transfinite total');
+
+        idxGEN = strcmp(SummaryTimingTable.InputGrid, gridName) & ...
+                 strcmp(SummaryTimingTable.Grid, gridSizeText) & ...
+                 strcmp(SummaryTimingTable.Method, 'gridGenerator total');
+
+        tfiMedian = NaN;
+        genMedian = NaN;
+        ratioVal = NaN;
+
+        if any(idxTFI)
+            tfiMedian = SummaryTimingTable.MedianSeconds(find(idxTFI, 1));
+        end
+        if any(idxGEN)
+            genMedian = SummaryTimingTable.MedianSeconds(find(idxGEN, 1));
+        end
+        if isfinite(tfiMedian) && tfiMedian > 0 && isfinite(genMedian)
+            ratioVal = genMedian / tfiMedian;
+        end
+
+        ratioRows(end+1,:) = {char(gridName), gridSizeText, Ns, Nt, ...
+            tfiMedian, genMedian, ratioVal}; %#ok<AGROW>
+    end
+end
+
+RatioTimingTable = cell2table(ratioRows, ...
+    'VariableNames', {'InputGrid','Grid','Ns','Nt', ...
+                      'TFITotalMedianSeconds','GridGeneratorMedianSeconds','GridGeneratorOverTFI'});
+
+end
+
+%% ========================================================================
+function plotTimingComparisonBars(SummaryTimingTable, GridCases, gridSizes)
+
+compareMethods = {'Transfinite total', 'gridGenerator total'};
+
+for rr = 1:size(gridSizes, 1)
+    Ns = gridSizes(rr, 1);
+    Nt = gridSizes(rr, 2);
+    gridSizeText = sprintf('%d x %d', Ns, Nt);
+
+    Y = NaN(numel(GridCases), numel(compareMethods));
+    labels = cell(numel(GridCases), 1);
+
+    for gg = 1:numel(GridCases)
+        labels{gg} = GridCases(gg).name;
+
+        for mm = 1:numel(compareMethods)
+            idx = strcmp(SummaryTimingTable.InputGrid, GridCases(gg).name) & ...
+                  strcmp(SummaryTimingTable.Grid, gridSizeText) & ...
+                  strcmp(SummaryTimingTable.Method, compareMethods{mm});
+
+            if any(idx)
+                Y(gg, mm) = SummaryTimingTable.MedianSeconds(find(idx, 1));
+            end
+        end
+    end
+
+    if all(~isfinite(Y(:)))
+        continue;
+    end
+
+    figure('Color','w');
+    bar(Y);
+    grid on;
+    ylabel('Median generation time, seconds');
+    title(sprintf('Grid generation timing, %s', gridSizeText), 'Interpreter', 'none');
+    set(gca, 'XTick', 1:numel(labels));
+    set(gca, 'XTickLabel', labels);
+    legend(compareMethods, 'Location', 'best', 'Interpreter', 'none');
+end
+
+end
+
+%% ========================================================================
+function [C_opt, E_grid, Xgen, Ygen, Jc, gridInfo] = runGridGeneratorSilently(grid_fun, Ns, Nt, Nsteps, suppressFigures, suppressConsole)
+
+oldFigVis = get(0, 'DefaultFigureVisible');
+figsBefore = findall(0, 'Type', 'figure');
+
+if suppressFigures
+    set(0, 'DefaultFigureVisible', 'off');
+end
+
+try
+    if suppressConsole
+        evalc('[C_opt, E_grid, Xgen, Ygen, Jc, ~, ~, ~, ~, gridInfo] = gridGenerator(grid_fun, Ns, Nt, Nsteps);');
+    else
+        [C_opt, E_grid, Xgen, Ygen, Jc, ~, ~, ~, ~, gridInfo] = gridGenerator(grid_fun, Ns, Nt, Nsteps);
+    end
+catch ME
+    if suppressFigures
+        set(0, 'DefaultFigureVisible', oldFigVis);
+        deleteNewFigures(figsBefore);
+    end
+    rethrow(ME);
+end
+
+if suppressFigures
+    set(0, 'DefaultFigureVisible', oldFigVis);
+    deleteNewFigures(figsBefore);
+end
+
+end
+
+%% ========================================================================
+function [X, Y] = callGridFunction(grid_fun, nptsx, nptsy, suppressFigures)
+
+oldFigVis = get(0, 'DefaultFigureVisible');
+figsBefore = findall(0, 'Type', 'figure');
+
+if suppressFigures
+    set(0, 'DefaultFigureVisible', 'off');
+end
+
+try
+    [X, Y] = grid_fun(nptsx, nptsy);
+catch ME
+    if suppressFigures
+        set(0, 'DefaultFigureVisible', oldFigVis);
+        deleteNewFigures(figsBefore);
+    end
+    rethrow(ME);
+end
+
+if suppressFigures
+    set(0, 'DefaultFigureVisible', oldFigVis);
+    deleteNewFigures(figsBefore);
+end
+
+end
+
+%% ========================================================================
+function deleteNewFigures(figsBefore)
+
+figsAfter = findall(0, 'Type', 'figure');
+newFigs = setdiff(figsAfter, figsBefore);
+if ~isempty(newFigs)
+    delete(newFigs);
+end
+
+end
+
+%% ========================================================================
+function [X, Y] = normalizeGridOrientation(X, Y, Nt, Ns, label)
+
+if ~isequal(size(X), size(Y))
+    error('%s returned X and Y with different sizes: X=%s, Y=%s.', ...
+        label, mat2str(size(X)), mat2str(size(Y)));
+end
+
+if ~isequal(size(X), [Nt, Ns]) && isequal(size(X), [Ns, Nt])
+    warning('GridTiming:TransposeGrid', '%s returned Ns x Nt. Transposing to Nt x Ns.', label);
+    X = X.';
+    Y = Y.';
+end
+
+if ~isequal(size(X), [Nt, Ns])
+    error('Expected %s output size Nt x Ns = %d x %d, got %s.', ...
+        label, Nt, Ns, mat2str(size(X)));
+end
+
+end
+
+%% ========================================================================
+function BND = buildBoundaryFromGrid(Xc, Yc)
+
+[J,I] = size(Xc);
+
+BND.X = nan(J,I);
+BND.Y = nan(J,I);
+
+BND.X(1,:) = Xc(1,:);
+BND.Y(1,:) = Yc(1,:);
+
+BND.X(J,:) = Xc(end,:);
+BND.Y(J,:) = Yc(end,:);
+
+BND.X(:,1) = Xc(:,1);
+BND.Y(:,1) = Yc(:,1);
+
+BND.X(:,I) = Xc(:,end);
+BND.Y(:,I) = Yc(:,end);
+
+BND.X(1,1) = Xc(1,1);
+BND.Y(1,1) = Yc(1,1);
+
+BND.X(1,I) = Xc(1,end);
+BND.Y(1,I) = Yc(1,end);
+
+BND.X(J,1) = Xc(end,1);
+BND.Y(J,1) = Yc(end,1);
+
+BND.X(J,I) = Xc(end,end);
+BND.Y(J,I) = Yc(end,end);
+
+end
+
+%% ========================================================================
+function [X, Y] = transfiniteInterpolationGrid(BND)
+
+[J,I] = size(BND.X);
+
+s = linspace(0,1,I);
+t = linspace(0,1,J);
+
+[S,T] = meshgrid(s,t);
+
+Xbottom = BND.X(1,:);
+Ybottom = BND.Y(1,:);
+
+Xtop = BND.X(end,:);
+Ytop = BND.Y(end,:);
+
+Xleft = BND.X(:,1);
+Yleft = BND.Y(:,1);
+
+Xright = BND.X(:,end);
+Yright = BND.Y(:,end);
+
+X00 = BND.X(1,1);       Y00 = BND.Y(1,1);
+X10 = BND.X(1,end);     Y10 = BND.Y(1,end);
+X01 = BND.X(end,1);     Y01 = BND.Y(end,1);
+X11 = BND.X(end,end);   Y11 = BND.Y(end,end);
+
+Xbottom2 = repmat(Xbottom, J, 1);
+Ybottom2 = repmat(Ybottom, J, 1);
+
+Xtop2 = repmat(Xtop, J, 1);
+Ytop2 = repmat(Ytop, J, 1);
+
+Xleft2 = repmat(Xleft, 1, I);
+Yleft2 = repmat(Yleft, 1, I);
+
+Xright2 = repmat(Xright, 1, I);
+Yright2 = repmat(Yright, 1, I);
+
+Xcorner = ...
+    (1-S).*(1-T)*X00 + ...
+       S .*(1-T)*X10 + ...
+    (1-S).*   T *X01 + ...
+       S .*   T *X11;
+
+Ycorner = ...
+    (1-S).*(1-T)*Y00 + ...
+       S .*(1-T)*Y10 + ...
+    (1-S).*   T *Y01 + ...
+       S .*   T *Y11;
+
+X = ...
+    (1-S).*Xleft2 + S.*Xright2 + ...
+    (1-T).*Xbottom2 + T.*Xtop2 - ...
+    Xcorner;
+
+Y = ...
+    (1-S).*Yleft2 + S.*Yright2 + ...
+    (1-T).*Ybottom2 + T.*Ytop2 - ...
+    Ycorner;
+
+end
+
+%% ========================================================================
+function gridSizes = normalizeGridSizes(gridSizes)
+
+if isempty(gridSizes)
+    error('gridSizes cannot be empty. Use one [Ns Nt] row per run.');
+end
+
+if isvector(gridSizes)
+    gridSizes = gridSizes(:).';
+end
+
+if size(gridSizes, 2) ~= 2
+    error(['gridSizes must be an N-by-2 matrix with one [Ns Nt] row per run.\n', ...
+           'Examples: gridSizes = [41 21]; or gridSizes = [41 21; 81 41].']);
+end
+
+gridSizes = round(gridSizes);
+
+if any(gridSizes(:) < 3)
+    error('All Ns and Nt values must be at least 3.');
+end
+
+end
+
+%% ========================================================================
+% Local no-plot grid functions
+% These mirror the project grids but avoid timing boundary/grid plotting.
+
+function [X, Y] = makeSoftCGridNoPlot(nptsx, nptsy)
+
+Ni = nptsx;
+Nj = nptsy;
+
+xi  = linspace(0,1,Ni+1);
+eta = linspace(0,1,Nj+1);
+
+[Xi, Eta] = meshgrid(xi, eta);
+
+rho = 2.0;
+b0 = 1.0;
+b1 = 2.0;
+
+R = b0 + (b1 - b0) * Eta;
+Theta = pi * (1 - 2*Xi)/2;
+
+X = rho * R .* cos(Theta);
+Y = R .* sin(Theta);
+
+end
+
+%% ========================================================================
+function [X, Y] = makeHardCGridNoPlot(nptsx, nptsy)
+
+% Sharp-cornered C boundary, no plotting.
+
+a1 = 0.5; b1 = 0.05;  % bottom corner sizes
+a2 = 1.0; b2 = 0.50;  % top corner sizes
+m = nptsx;            % points along bottom/top boundary
+n = nptsy;            % points along left/right boundary
+
+tb = linspace(0,1,m+1);
+tt = linspace(0,1,m+1);
+tl = linspace(0,1,n+1);
+
+xlb = 2*(a1+b1);
+xlt = 2*(a2+b2);
+rb1 = a1 / xlb;
+rb2 = (a1+2*b1)/xlb;
+rt1 = a2 / xlt;
+rt2 = (a2+2*b2)/xlt;
+
+xb_bdry = zeros(size(tb));
+yb_bdry = zeros(size(tb));
+xt_bdry = zeros(size(tt));
+yt_bdry = zeros(size(tt));
+xl_bdry = zeros(size(tl));
+yl_bdry = zeros(size(tl));
+xr_bdry = zeros(size(tl));
+yr_bdry = zeros(size(tl));
+
+for i = 1:length(tb)
+    if tb(i) <= rb1
+        xb_bdry(i) = xlb*tb(i);
+        yb_bdry(i) = b1;
+    elseif tb(i) > rb1 && tb(i) < rb2
+        xb_bdry(i) = a1;
+        yb_bdry(i) = xlb*(0.5-tb(i));
+    else
+        xb_bdry(i) = xlb*(1 - tb(i));
+        yb_bdry(i) = -b1;
+    end
+
+    if tt(i) <= rt1
+        xt_bdry(i) = xlt*tt(i);
+        yt_bdry(i) = b2;
+    elseif tt(i) > rt1 && tt(i) < rt2
+        xt_bdry(i) = a2;
+        yt_bdry(i) = xlt*(0.5 - tt(i));
+    else
+        xt_bdry(i) = xlt*(1 - tt(i));
+        yt_bdry(i) = -b2;
+    end
+end
+
+for j = 1:length(tl)
+    xl_bdry(j) = 0;
+    yl_bdry(j) = (1 - tl(j))*b1 + tl(j)*b2;
+    xr_bdry(j) = 0;
+    yr_bdry(j) = -yl_bdry(j);
+end
+
+X = zeros(n+1, m+1);
+Y = zeros(n+1, m+1);
+
+for j = 1:n+1
+    t = tl(j);
+
+    for i = 1:m+1
+        s = tb(i);
+
+        X(j,i) = (1-s)*xl_bdry(j) + s*xr_bdry(j) + ...
+                 (1-t)*xb_bdry(i) + t*xt_bdry(i) - ...
+                 ((1-s)*(1-t)*xl_bdry(1) + s*(1-t)*xr_bdry(1) + ...
+                  (1-s)*t*xl_bdry(end) + s*t*xr_bdry(end));
+
+        Y(j,i) = (1-s)*yl_bdry(j) + s*yr_bdry(j) + ...
+                 (1-t)*yb_bdry(i) + t*yt_bdry(i) - ...
+                 ((1-s)*(1-t)*yl_bdry(1) + s*(1-t)*yr_bdry(1) + ...
+                  (1-s)*t*yl_bdry(end) + s*t*yr_bdry(end));
+    end
+end
+
+end
+
+%% ========================================================================
+function [X, Y] = makeSwanGridNoPlot(nptsx, nptsy)
+
+Ni = nptsx;
+Nj = nptsy;
+
+xi  = linspace(0,1,Ni+1);
+eta = linspace(0,1,Nj+1);
+
+[X, Y] = meshgrid(xi, eta);
+
+f1 = @(s) [s, 0];                         % bottom
+f2 = @(s) [1 + 2*s - 2*s.^2, s];          % right
+f3 = @(s) [s, 1 - 3*s + 3*s.^2];          % top
+f4 = @(s) [0, s];                         % left
+
+Pbl = f1(0);
+Pbr = f1(1);
+Ptl = f3(0);
+Ptr = f3(1);
+
+for j = 1:Nj+1
+    t = eta(j);
+
+    for i = 1:Ni+1
+        s = xi(i);
+
+        B = f1(s);
+        R = f2(t);
+        T = f3(s);
+        L = f4(t);
+
+        P = (1-t)*B + t*T + (1-s)*L + s*R ...
+          - (1-s)*(1-t)*Pbl ...
+          - s*(1-t)*Pbr ...
+          - (1-s)*t*Ptl ...
+          - s*t*Ptr;
+
+        X(j,i) = P(1);
+        Y(j,i) = P(2);
+    end
+end
+
+end
